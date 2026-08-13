@@ -334,7 +334,9 @@ class MultiprocExecutor(Executor):
             self.failure_callback = callback
 
     def execute_model(  # type: ignore[override]
-        self, scheduler_output: SchedulerOutput, non_block: bool = False,
+        self,
+        scheduler_output: SchedulerOutput,
+        non_block: bool = False,
         role: str | None = None,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         return self.collective_rpc(
@@ -346,8 +348,29 @@ class MultiprocExecutor(Executor):
             kv_output_aggregator=self.kv_output_aggregator,
         )
 
+    def execute_model_dual(
+        self,
+        lat_scheduler_output: SchedulerOutput,
+        thr_scheduler_output: SchedulerOutput,
+        lat_grammar_output: GrammarOutput | None,
+        thr_grammar_output: GrammarOutput | None,
+    ) -> tuple[ModelRunnerOutput, ModelRunnerOutput]:
+        return self.collective_rpc(
+            "execute_model_dual",
+            args=(
+                lat_scheduler_output,
+                thr_scheduler_output,
+                lat_grammar_output,
+                thr_grammar_output,
+            ),
+            unique_reply_rank=self.output_rank,
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+        )
+
     def sample_tokens(  # type: ignore[override]
-        self, grammar_output: GrammarOutput | None, non_block: bool = False,
+        self,
+        grammar_output: GrammarOutput | None,
+        non_block: bool = False,
         role: str | None = None,
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
         return self.collective_rpc(

@@ -91,16 +91,29 @@ FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
 
-trtllm_workspace_buffer = None
+trtllm_workspace_buffers: dict[str | None, torch.Tensor] = {}
+
+
+def _workspace_role() -> str | None:
+    try:
+        from vllm.v1.worker import dual_stream
+
+        if dual_stream.enabled() and dual_stream.current_role() == dual_stream.LATENCY:
+            return dual_stream.LATENCY
+    except ImportError:
+        pass
+    return None
 
 
 def _get_trtllm_workspace_buffer():
-    global trtllm_workspace_buffer
-    if trtllm_workspace_buffer is None:
-        trtllm_workspace_buffer = torch.zeros(
+    role = _workspace_role()
+    workspace_buffer = trtllm_workspace_buffers.get(role)
+    if workspace_buffer is None:
+        workspace_buffer = torch.zeros(
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
         )
-    return trtllm_workspace_buffer
+        trtllm_workspace_buffers[role] = workspace_buffer
+    return workspace_buffer
 
 
 def _pack_draft_block_bool_mask(

@@ -117,11 +117,14 @@ class UniProcExecutor(Executor):
         return future
 
     def execute_model(  # type: ignore[override]
-        self, scheduler_output: SchedulerOutput, non_block: bool = False
+        self,
+        scheduler_output: SchedulerOutput,
+        non_block: bool = False,
+        role: str | None = None,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         output = self.collective_rpc(
             "execute_model",
-            args=(scheduler_output,),
+            args=(scheduler_output, role) if role is not None else (scheduler_output,),
             non_block=non_block,
             single_value=True,
         )
@@ -131,12 +134,33 @@ class UniProcExecutor(Executor):
             output.result()
         return output
 
+    def execute_model_dual(
+        self,
+        lat_scheduler_output: SchedulerOutput,
+        thr_scheduler_output: SchedulerOutput,
+        lat_grammar_output: GrammarOutput | None,
+        thr_grammar_output: GrammarOutput | None,
+    ) -> tuple[ModelRunnerOutput, ModelRunnerOutput]:
+        return self.collective_rpc(
+            "execute_model_dual",
+            args=(
+                lat_scheduler_output,
+                thr_scheduler_output,
+                lat_grammar_output,
+                thr_grammar_output,
+            ),
+            single_value=True,
+        )
+
     def sample_tokens(  # type: ignore[override]
-        self, grammar_output: GrammarOutput | None, non_block: bool = False
+        self,
+        grammar_output: GrammarOutput | None,
+        non_block: bool = False,
+        role: str | None = None,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         return self.collective_rpc(
             "sample_tokens",
-            args=(grammar_output,),
+            args=(grammar_output, role) if role is not None else (grammar_output,),
             non_block=non_block,
             single_value=True,
         )

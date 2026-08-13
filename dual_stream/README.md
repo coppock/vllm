@@ -1,95 +1,134 @@
-# Dual priority-stream execution (foundational layer)
+# Dual priority-stream execution
 
-Lets one vLLM engine run a **latency-critical** stream and a **throughput** stream
-concurrently on the same GPUs, sharing one copy of the weights, on two CUDA streams at
-different priorities.
+This opt-in vLLM execution mode runs a latency-critical batch and a throughput
+batch concurrently in one worker process. Both roles share one copy of the
+model weights, but use separate scheduler, runner, KV-cache, workspace, and
+CUDA-stream state.
 
-Sharing weights is not an optimisation here, it is a requirement. For a large MoE the weights
-dominate device memory, so two independent processes cannot both hold a copy — on the model
-this was developed against, weights plus non-torch memory were 193.75 GiB per GPU on a
-267.69 GiB card. Two copies do not fit; one copy plus two schedulers does.
+The latency role uses a small scheduler batch on a high-priority CUDA stream.
+The throughput role uses the normal scheduler batch on a low-priority stream.
+Requests with `priority < 0` go to the latency scheduler; all other requests go
+to the throughput scheduler.
 
 ## Status
 
-**The plumbing in `vllm_dual_stream.py` is untested as an engine integration.** What *has*
-been measured is the primitive it depends on — see below. The scheduler, KV-partitioning and
-request-routing layers are deliberately not implemented; they are listed as `MISSING` in the
-module docstring.
+Concurrent execution is working end to end with tensor parallelism. It was
+validated on vLLM 0.27.1 with Qwen3.5-0.8B at TP=4 on four NVIDIA A10Gs. The
+durable upstream branch also passes its focused unit tests, Ruff, formatting,
+mypy, repository policy hooks, Python compilation, and `git diff --check`.
+
+An earlier sequential version was validated with Kimi-K3 at TP=8 on eight
+B300s. The current concurrent vendor patch is ready, but has not yet been run
+with Kimi-K3.
+
+## How it works
+
+`EngineCore` owns two schedulers over matching partitions of the available KV
+cache. When both roles have work, it sends both scheduler outputs in one RPC.
+Each GPU worker fans that RPC out to two host threads and launches the model
+runners on separate CUDA streams.
+
+The two runners share the model module and weights. Their mutable state is not
+shared: input batches, block tables, KV tensors, forward contexts, attention
+workspaces, and FlashInfer workspaces are role-specific.
+
+Both roles use the existing TP process group. Host-side collective calls are
+ordered identically on every rank, and CUDA events serialize collective kernel
+execution while allowing non-collective model compute to overlap. Plain
+`torch.distributed` all-reduce is used in this path because vLLM's custom
+all-reduce owns shared staging buffers that are not safe for two in-flight
+forwards.
+
+This collective sequencing is required for correctness. The original
+prototype created a second NCCL communicator and launched from two host
+threads. With `NCCL_LAUNCH_ORDER_IMPLICIT=1` and
+`NCCL_LAUNCH_RACE_FATAL=1`, NCCL reported a host-thread launch race. Stack
+traces at sampled-token copies were only where the CPU first observed the
+unfinished GPU work; those copies were not the root cause.
+
+## Running it
+
+Use eager, synchronous scheduling:
+
+```bash
+VLLM_DUAL_STREAM=1 \
+VLLM_DUAL_STREAM_LATENCY_KV_FRAC=0.10 \
+VLLM_DUAL_STREAM_LATENCY_MAX_NUM_SEQS=1 \
+vllm serve MODEL \
+  --tensor-parallel-size 4 \
+  --enforce-eager \
+  --no-async-scheduling
+```
+
+Send a negative OpenAI request priority for latency-sensitive work:
+
+```json
+{
+  "model": "MODEL",
+  "prompt": "...",
+  "priority": -1,
+  "max_tokens": 16
+}
+```
+
+Environment variables:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `VLLM_DUAL_STREAM` | `0` | Enable the feature when set to `1`. |
+| `VLLM_DUAL_STREAM_LATENCY_KV_FRAC` | `0.10` | Fraction of KV blocks reserved for latency requests. |
+| `VLLM_DUAL_STREAM_LATENCY_MAX_NUM_SEQS` | `1` | Maximum latency-role batch size. |
+| `VLLM_DUAL_STREAM_WARMUP_STEPS` | `0` | Optional sequential mixed steps for diagnosis. Normal operation should leave this at zero. |
+
+Startup rejects unsupported combinations instead of silently falling back:
+CUDA graphs, async scheduling, ubatching/DBO, KV or encoder-cache transfer
+connectors, and parallel modes other than tensor parallelism.
+
+## Validation results
+
+The TP=4 stress workload used eight throughput requests at 160 output tokens
+and four staggered latency requests at 16 output tokens.
+
+| Workload | Result |
+| --- | ---: |
+| Throughput only | 1,280 output tokens in 5.940 s, 215.48 tok/s |
+| Latency only | completions at 0.610, 1.203, 1.800, 2.395 s |
+| Mixed, repeated run | latency completions at 1.664, 3.261, 4.826, 6.414 s |
+| Mixed, repeated run | throughput requests completed in 10.395-10.440 s |
+| Mixed, repeated run | 128.73 combined tok/s; no NCCL races or engine errors |
+
+These numbers establish correctness and real overlap, not ideal isolation. CUDA
+stream priority affects pending block scheduling and does not preempt already
+running blocks. On this small A10G model, mixed latency was about 2.7x solo and
+throughput retained about 57% of its solo rate. The B300/Kimi-K3 workload must
+be benchmarked before drawing production capacity conclusions.
 
 ## Files
 
-| file | what it does |
-|---|---|
-| `vllm_dual_stream.py` | Opt-in overlay (`VLLM_DUAL_STREAM=1`): a second TP NCCL communicator, thread-aware `get_tp_group()`, and two CUDA streams at different priorities. Monkey-patches at import so the installed wheel stays byte-identical. |
-| `dual_stream_probe.py` | Standalone feasibility probe. No vLLM dependency. Answers whether the design can work at all before any engine code is written. |
+| File | Purpose |
+| --- | --- |
+| `vllm/v1/worker/dual_stream.py` | Role streams, shared-TP collective sequencing, KV split, and shared-weight runner setup. |
+| `vllm/v1/engine/core.py` | Dual schedulers, priority routing, and merged mixed-role steps. |
+| `vllm/v1/worker/gpu_worker.py` | Per-role runners and concurrent worker execution. |
+| `vllm/forward_context.py` | Thread-safe forward context using `ContextVar`. |
+| `vllm/distributed/parallel_state.py` | Thread-safe TP-group override visible through existing imports. |
+| `vllm/v1/worker/workspace.py` | Separate latency scratch workspace. |
+| `vllm/v1/attention/backends/flashinfer.py` | Separate latency FlashInfer workspace. |
+| `dual_engine.patch` | Current combined patch for vendor vLLM `20260803.dev23+g9d083cdd6`. |
+| `dual_stream_probe.py` | Standalone CUDA/NCCL feasibility benchmark. |
 
-## Run the probe first
+`vllm_dual_stream.py` is retained only as a historical overlay from the first
+prototype. The in-tree implementation above is authoritative.
 
-```
-torchrun --nproc_per_node=8 dual_stream_probe.py --layers 8 --iters 30 --heavy-experts 128
-```
+## Current limits
 
-It answers three questions:
-
-1. **Deadlock?** Two NCCL communicators issuing concurrent collectives from two threads on two
-   streams. NCCL collective kernels are persistent, and two that cannot co-reside can deadlock.
-   This is the risk that can kill the design outright.
-2. **Does stream priority protect the latency stream?** Priority schedules new blocks; it does
-   not preempt running ones, so protection can be much weaker than the API implies.
-3. **What does hosting the latency stream cost the throughput stream?**
-
-### Measured on 8xB300, TP=8
-
-| | result |
-|---|---|
-| deadlock | **no** — concurrent collectives on two comms completed |
-| latency stream p50 | **1.02x** its solo latency while a saturating stream ran alongside |
-| latency stream p99 | 1.64x — priority protects the median, not the tail |
-| throughput stream | retained **87%** of solo throughput |
-
-The 13% cost is not free capacity: at batch 64 the engine is ~8.8x more efficient per token
-than at batch 1, so 13% of a 64-way batch is roughly the capacity of 8 sequences, spent to
-serve 1 at low latency. The design buys **latency isolation**, not throughput.
-
-Two probe bugs worth knowing about, both fixed and both of which first presented as a NCCL
-deadlock: `torch.cuda.set_device()` binds per-thread and is **not** inherited by worker
-threads, and fixed-iteration loops of unequal step cost stop overlapping once the fast stream
-retires, diluting measured interference toward zero.
-
-## Update: the engine integration now works
-
-The layers listed as `MISSING` above are implemented and serving. Each TP worker holds one
-copy of the weights and two model-runner states; `EngineCore` runs two schedulers over
-matching KV partitions and routes by request priority (`priority < 0` -> latency engine).
-
-Verified on 8xB300 / Kimi-K3 / TP=8: both roles return correct output over repeated
-alternating requests, with the KV pool split 51.1 / 5.7 GiB out of an unchanged 56.8 GiB.
-
-### Known limits
-
-* **Execution is sequential** - the latency batch runs, then the throughput batch. Concurrent
-  execution across the two streams, which is the entire point of the architecture, is not
-  implemented. The probe numbers (1.02x latency p50, 87% throughput retention) therefore
-  remain a projection, not an end-to-end measurement.
-* **Requires `--no-async-scheduling`.** With async scheduling the engine drives
-  `step_with_batch_queue` rather than `step`, which is not patched.
-* **The secondary TP group bypasses the custom all-reduce**, whose single shared staging
-  buffer would corrupt under two concurrent forwards. Plain NCCL is correct but slower.
-* **A failed latency request kills the engine**, so this is not safe to leave serving.
-
-### Provenance
-
-Developed and verified against a vendor fork of vLLM (`20260803.dev23+g9d083cdd6`), not
-against this tree's `main`. The diff applies cleanly here, but "applies cleanly" is textual -
-it has **not** been run against upstream vLLM. `dual_engine.patch` is the original patch as
-generated on the verified tree.
-
-### The six defects, all found by running it
-
-1. `load_model()` side effects (`decode_query_len`) missing on the second runner
-2. `KVCacheConfig` shallow copy kept full tensor byte sizes -> 2x KV -> OOM
-3. async scheduling bypassed the patched `step()` entirely
-4. `WorkerWrapperBase.execute_model()` dropped the `role` argument
-5. `_init_kv_zero_meta()` not run for the latency runner
-6. `sample_tokens()` also needs the role - it is the second half of the same forward, so
-   sampling against the other runner found no pending batch and silently returned `None`
+- CUDA/NCCL and tensor parallelism only. Pipeline, data, context, and expert
+  parallel collectives have not been integrated with the role sequencer.
+- CUDA graphs, async scheduling, ubatching/DBO, and cache-transfer connectors
+  are disabled.
+- The latency KV partition is fixed at startup. A latency request exceeding
+  that reservation cannot borrow blocks from the throughput partition.
+- LoRA mutation, sleep/wake, elastic scaling, speculative decoding, pooling,
+  and structured outputs need dedicated concurrent stress coverage before
+  production use.
+- Stream priority is advisory scheduling, not GPU preemption.

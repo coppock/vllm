@@ -24,8 +24,22 @@ def _compute_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
 _MB = 1024**2
 _GiB = 1024**3
 
-# Global workspace manager instance
-_manager: "WorkspaceManager | None" = None
+# The default workspace belongs to the normal throughput path. The latency
+# runner needs distinct scratch storage because the two forwards may execute
+# concurrently. Keeping the throughput key as None preserves the original
+# behavior everywhere outside dual-stream execution.
+_managers: dict[str | None, "WorkspaceManager | None"] = {None: None}
+
+
+def _workspace_role() -> str | None:
+    try:
+        from vllm.v1.worker import dual_stream
+
+        if dual_stream.enabled() and dual_stream.current_role() == dual_stream.LATENCY:
+            return dual_stream.LATENCY
+    except ImportError:
+        pass
+    return None
 
 
 class WorkspaceManager:
@@ -197,7 +211,7 @@ def is_workspace_manager_initialized() -> bool:
     Returns:
         True if workspace manager is initialized, False otherwise.
     """
-    return _manager is not None
+    return _managers.get(_workspace_role()) is not None
 
 
 def current_workspace_manager() -> "WorkspaceManager":
@@ -206,11 +220,18 @@ def current_workspace_manager() -> "WorkspaceManager":
     Raises:
         AssertionError: If workspace manager has not been initialized.
     """
-    assert _manager is not None, (
+    role = _workspace_role()
+    manager = _managers.get(role)
+    if manager is None and role is not None:
+        primary = _managers.get(None)
+        assert primary is not None
+        manager = WorkspaceManager(primary._device, primary._num_ubatches)
+        _managers[role] = manager
+    assert manager is not None, (
         "WorkspaceManager not initialized. Call init_workspace_manager() "
         "with a device before using workspace functions."
     )
-    return _manager
+    return manager
 
 
 def init_workspace_manager(
@@ -225,15 +246,16 @@ def init_workspace_manager(
         device: The device to allocate workspace on.
         num_ubatches: Number of workspace ubatch slots. Defaults to 1.
     """
-    global _manager
-    if _manager is not None:
+    role = _workspace_role()
+    manager = _managers.get(role)
+    if manager is not None:
         logger.warning(
             "WorkspaceManager already initialized on device %s, "
             "reinitializing on device %s",
-            _manager._device,
+            manager._device,
             device,
         )
-    _manager = WorkspaceManager(device, num_ubatches)
+    _managers[role] = WorkspaceManager(device, num_ubatches)
 
 
 def lock_workspace() -> None:
@@ -275,5 +297,4 @@ def reset_workspace_manager() -> None:
     This is primarily intended for testing purposes to allow tests
     to reinitialize the workspace manager cleanly.
     """
-    global _manager
-    _manager = None
+    _managers[_workspace_role()] = None

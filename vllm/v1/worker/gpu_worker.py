@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -442,21 +442,29 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
-        # Dual-stream: build the latency-role runner AFTER weights exist, pointing it at the
-        # same nn.Module. Runner state (input batch, block tables, buffers) must be distinct
-        # per role or two concurrent forwards corrupt each other; the weights must not be.
+        # Build the latency runner after weights exist, pointing it at the same
+        # nn.Module. Mutable runner state must be distinct; weights must not be.
         from vllm.v1.worker import dual_stream as _ds
 
         self.dual_stream_runner = None
         if _ds.enabled():
-            def _make_runner():
-                if self.use_v2_model_runner:
-                    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as _R
-                else:
-                    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as _R
-                return _R(self.vllm_config, self.device)
 
-            _, self.dual_stream_runner = _ds.init_worker(_make_runner, self.model_runner)
+            def _make_runner() -> Any:
+                if self.use_v2_model_runner:
+                    from vllm.v1.worker.gpu.model_runner import (
+                        GPUModelRunner as GPUModelRunnerV2,
+                    )
+
+                    return GPUModelRunnerV2(self.vllm_config, self.device)
+                from vllm.v1.worker.gpu_model_runner import (
+                    GPUModelRunner as GPUModelRunnerV1,
+                )
+
+                return GPUModelRunnerV1(self.vllm_config, self.device)
+
+            _, self.dual_stream_runner = _ds.init_worker(
+                _make_runner, self.model_runner
+            )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -681,12 +689,14 @@ class Worker(WorkerBase):
         from vllm.v1.worker import dual_stream as _ds
 
         if _ds.enabled() and getattr(self, "dual_stream_runner", None) is not None:
+            latency_runner = self.dual_stream_runner
+            assert latency_runner is not None
             thr_cfg, lat_cfg = _ds.split_kv_cache_config(
                 kv_cache_config, _ds.latency_kv_fraction()
             )
             with self._maybe_get_memory_pool_context(tag="kv_cache"):
                 self.model_runner.initialize_kv_cache(thr_cfg)
-                self.dual_stream_runner.initialize_kv_cache(lat_cfg)
+                latency_runner.initialize_kv_cache(lat_cfg)
         else:
             with self._maybe_get_memory_pool_context(tag="kv_cache"):
                 self.model_runner.initialize_kv_cache(kv_cache_config)
@@ -706,7 +716,6 @@ class Worker(WorkerBase):
             ds_runner = getattr(self, "dual_stream_runner", None)
             if ds_runner is not None and hasattr(ds_runner, "_init_kv_zero_meta"):
                 ds_runner._init_kv_zero_meta()
-
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
@@ -907,9 +916,13 @@ class Worker(WorkerBase):
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
+        if (runner := getattr(self, "dual_stream_runner", None)) is not None:
+            runner.reset_mm_cache()
 
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
+        if (runner := getattr(self, "dual_stream_runner", None)) is not None:
+            runner.reset_encoder_cache()
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
@@ -1064,14 +1077,95 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    def execute_model_dual(
+        self,
+        lat_scheduler_output: "SchedulerOutput",
+        thr_scheduler_output: "SchedulerOutput",
+        lat_grammar_output: "GrammarOutput | None",
+        thr_grammar_output: "GrammarOutput | None",
+    ):
+        """Run both scheduler outputs concurrently on their role streams."""
+        import threading
+
+        from vllm.v1.worker import dual_stream as _ds
+
+        outputs: dict[str, Any] = {}
+
+        def run(role, scheduler_output, grammar_output, runner):
+            try:
+                current_platform.set_device(self.device)
+                with _ds.on_stream(role):
+                    output = runner.execute_model(scheduler_output)
+                    if output is None:
+                        output = runner.sample_tokens(grammar_output)
+                    _ds.finish_collectives(role)
+                outputs[role] = output
+            except BaseException as exc:
+                outputs[role] = exc
+                _ds.abort_collectives()
+
+        self._ds_primed = getattr(self, "_ds_primed", 0)
+        if self._ds_primed < _ds.sequential_warmup_steps():
+            self._ds_primed += 1
+            run(
+                _ds.LATENCY,
+                lat_scheduler_output,
+                lat_grammar_output,
+                self.dual_stream_runner,
+            )
+            run(
+                _ds.THROUGHPUT,
+                thr_scheduler_output,
+                thr_grammar_output,
+                self.model_runner,
+            )
+        else:
+            threads = [
+                threading.Thread(
+                    target=run,
+                    args=(
+                        _ds.LATENCY,
+                        lat_scheduler_output,
+                        lat_grammar_output,
+                        self.dual_stream_runner,
+                    ),
+                ),
+                threading.Thread(
+                    target=run,
+                    args=(
+                        _ds.THROUGHPUT,
+                        thr_scheduler_output,
+                        thr_grammar_output,
+                        self.model_runner,
+                    ),
+                ),
+            ]
+            with _ds.sequenced_collectives():
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+        for role in (_ds.LATENCY, _ds.THROUGHPUT):
+            error = outputs.get(role)
+            if isinstance(error, BaseException):
+                raise error
+        return outputs[_ds.LATENCY], outputs[_ds.THROUGHPUT]
+
+    @torch.inference_mode()
+    @with_gpu_sync_check
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None", role: str | None = None
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         from vllm.v1.worker import dual_stream as _ds
 
-        if role == _ds.LATENCY and getattr(self, "dual_stream_runner", None) is not None:
+        if (
+            role == _ds.LATENCY
+            and getattr(self, "dual_stream_runner", None) is not None
+        ):
             saved = self.model_runner
-            self.model_runner = self.dual_stream_runner
+            latency_runner = cast("GPUModelRunner", self.dual_stream_runner)
+            self.model_runner = latency_runner
             try:
                 with _ds.on_stream(_ds.LATENCY):
                     return self.model_runner.sample_tokens(grammar_output)
@@ -1091,9 +1185,13 @@ class Worker(WorkerBase):
         # communicator. Default (None) is the unmodified single-engine path.
         from vllm.v1.worker import dual_stream as _ds
 
-        if role == _ds.LATENCY and getattr(self, "dual_stream_runner", None) is not None:
+        if (
+            role == _ds.LATENCY
+            and getattr(self, "dual_stream_runner", None) is not None
+        ):
             _saved = self.model_runner
-            self.model_runner = self.dual_stream_runner
+            latency_runner = cast("GPUModelRunner", self.dual_stream_runner)
+            self.model_runner = latency_runner
             try:
                 with _ds.on_stream(_ds.LATENCY):
                     return self._execute_model_inner(scheduler_output)

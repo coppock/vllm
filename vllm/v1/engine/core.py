@@ -118,6 +118,10 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        from vllm.v1.worker import dual_stream as _ds
+
+        if _ds.enabled():
+            _ds.validate_config(vllm_config)
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -158,12 +162,10 @@ class EngineCore:
             kv_cache_config, vllm_config
         )
 
-        # Dual-stream: the workers carve their KV pool into a throughput and a latency
-        # partition, so the schedulers must be built over the MATCHING block counts or they
-        # would hand out block ids their runner has no memory for. The two partitions are
-        # separate tensors, so block id N in one is unrelated to block id N in the other.
-        from vllm.v1.worker import dual_stream as _ds
-
+        # Dual-stream: the workers carve their KV pool into throughput and
+        # latency partitions, so the schedulers must use the matching block
+        # counts. Otherwise they could assign block ids that the runner has no
+        # memory for. Each partition has its own tensors and block-id namespace.
         _thr_kv_cfg, _lat_kv_cfg = (kv_cache_config, None)
         if _ds.enabled():
             _thr_kv_cfg, _lat_kv_cfg = _ds.split_kv_cache_config(
@@ -190,7 +192,12 @@ class EngineCore:
                 block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
             )
-            logger.info("dual-stream: latency scheduler created")
+            latency_max_num_seqs = _ds.latency_max_num_seqs()
+            cast(Any, self.scheduler_lat).max_num_running_reqs = latency_max_num_seqs
+            logger.info(
+                "dual-stream: latency scheduler created (max_num_seqs=%d)",
+                latency_max_num_seqs,
+            )
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -497,19 +504,17 @@ class EngineCore:
                 "Disabling ECTransfer for this request."
             )
 
+        scheduler_lat = self.scheduler_lat
         _lat_ok = (
-            getattr(self, "scheduler_lat", None) is not None
+            scheduler_lat is not None
             and getattr(request, "priority", 0) is not None
             and getattr(request, "priority", 0) < 0
         )
-        logger.info("DSDBG add_request id=%s priority=%s -> %s",
-                    getattr(request, "request_id", "?"),
-                    getattr(request, "priority", None),
-                    "LATENCY" if _lat_ok else "throughput")
         if _lat_ok:
-            # Negative priority marks a latency-critical request. vLLM already carries a
-            # per-request priority field, so routing needs no new API surface.
-            self.scheduler_lat.add_request(request)
+            assert scheduler_lat is not None
+            # Negative priority marks a latency-critical request. vLLM already
+            # carries a per-request priority field, so this needs no new API.
+            scheduler_lat.add_request(request)
         else:
             self.scheduler.add_request(request)
         if request.abort_immediately:
@@ -523,7 +528,14 @@ class EngineCore:
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
-        self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        for scheduler in self._all_schedulers():
+            scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    def _all_schedulers(self) -> tuple[SchedulerInterface, ...]:
+        scheduler_lat = self.scheduler_lat
+        if scheduler_lat is None:
+            return (self.scheduler,)
+        return self.scheduler, scheduler_lat
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -616,12 +628,11 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
-
     def _any_scheduler_has_requests(self) -> bool:
         """Work exists if EITHER engine has it.
 
-        Without this, a latency-routed request is accepted and then starves: the busy loop
-        gates on the throughput scheduler and never calls step().
+        Without this, a latency-routed request is accepted and then starves:
+        the busy loop gates on the throughput scheduler and never calls step().
         """
         if self.scheduler.has_requests():
             return True
@@ -638,12 +649,48 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         lat_outputs: dict[int, EngineCoreOutputs] = {}
+        lat_model_executed = False
         sched_lat = getattr(self, "scheduler_lat", None)
-        if sched_lat is not None and sched_lat.has_requests():
-            logger.info("DSDBG step: latency scheduler has requests")
+        lat_has_requests = sched_lat is not None and sched_lat.has_requests()
+        thr_has_requests = self.scheduler.has_requests()
+
+        if lat_has_requests and thr_has_requests:
+            assert sched_lat is not None
             lat_sched_out = sched_lat.schedule()
-            logger.info("DSDBG step: latency scheduled tokens=%s",
-                        getattr(lat_sched_out, "total_num_scheduled_tokens", "?"))
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            lat_grammar = sched_lat.get_grammar_bitmask(lat_sched_out)
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with (
+                self.capture_iteration_details(scheduler_output) as iteration_details,
+                self.log_error_detail(scheduler_output),
+            ):
+                lat_model_out, model_output = self.model_executor.execute_model_dual(
+                    lat_sched_out,
+                    scheduler_output,
+                    lat_grammar,
+                    grammar_output,
+                )
+
+            self._process_aborts_queue()
+            lat_outputs = sched_lat.update_from_output(lat_sched_out, lat_model_out)
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+            self._attach_iteration_details(engine_core_outputs, iteration_details)
+            for client_index, output in lat_outputs.items():
+                if client_index in engine_core_outputs:
+                    engine_core_outputs[client_index].outputs.extend(output.outputs)
+                else:
+                    engine_core_outputs[client_index] = output
+            return engine_core_outputs, (
+                lat_sched_out.total_num_scheduled_tokens > 0
+                or scheduler_output.total_num_scheduled_tokens > 0
+            )
+
+        if lat_has_requests:
+            assert sched_lat is not None
+            lat_sched_out = sched_lat.schedule()
+            lat_model_executed = lat_sched_out.total_num_scheduled_tokens > 0
             lat_future = self.model_executor.execute_model(
                 lat_sched_out, non_block=True, role="latency"
             )
@@ -653,13 +700,11 @@ class EngineCore:
                 lat_model_out = self.model_executor.sample_tokens(
                     lat_grammar, role="latency"
                 )
+            self._process_aborts_queue()
             lat_outputs = sched_lat.update_from_output(lat_sched_out, lat_model_out)
-            logger.info("DSDBG step: latency outputs clients=%s total=%s",
-                        list(lat_outputs.keys()),
-                        sum(len(o.outputs) for o in lat_outputs.values()))
 
-        if not self.scheduler.has_requests():
-            return lat_outputs, bool(lat_outputs)
+        if not thr_has_requests:
+            return lat_outputs, lat_model_executed
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
@@ -829,6 +874,8 @@ class EngineCore:
             self.model_executor.shutdown()
         if self.scheduler:
             self.scheduler.shutdown()
+        if self.scheduler_lat:
+            self.scheduler_lat.shutdown()
 
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become
@@ -846,7 +893,7 @@ class EngineCore:
     def reset_mm_cache(self):
         # NOTE: Since this is mainly for debugging, we don't attempt to
         # re-sync the internal caches (P0 sender, P1 receiver)
-        if self.scheduler.has_unfinished_requests():
+        if any(s.has_unfinished_requests() for s in self._all_schedulers()):
             logger.warning(
                 "Resetting the multi-modal cache when requests are "
                 "in progress may lead to desynced internal caches."
@@ -861,9 +908,14 @@ class EngineCore:
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        return self.scheduler.reset_prefix_cache(
-            reset_running_requests, reset_connector
-        )
+        results = [
+            scheduler.reset_prefix_cache(
+                reset_running_requests,
+                reset_connector,
+            )
+            for scheduler in self._all_schedulers()
+        ]
+        return all(results)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
@@ -874,14 +926,15 @@ class EngineCore:
         """
         # NOTE: Since this is mainly for debugging, we don't attempt to
         # re-sync the internal caches (P0 sender, P1 receiver)
-        if self.scheduler.has_unfinished_requests():
+        if any(s.has_unfinished_requests() for s in self._all_schedulers()):
             logger.warning(
                 "Resetting the encoder cache when requests are "
                 "in progress may lead to desynced internal caches."
             )
 
         # Reset the scheduler's encoder cache manager (logical state)
-        self.scheduler.reset_encoder_cache()
+        for scheduler in self._all_schedulers():
+            scheduler.reset_encoder_cache()
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
 
@@ -922,10 +975,12 @@ class EngineCore:
             raise ValueError("'wait' mode can't be used in inproc-engine mode")
 
         if mode == "abort":
-            self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+            for scheduler in self._all_schedulers():
+                scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
-        self.scheduler.set_pause_state(pause_state)
+        for scheduler in self._all_schedulers():
+            scheduler.set_pause_state(pause_state)
         if clear_cache:
             self._reset_caches()
 
@@ -933,11 +988,15 @@ class EngineCore:
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
-        self.scheduler.set_pause_state(PauseState.UNPAUSED)
+        for scheduler in self._all_schedulers():
+            scheduler.set_pause_state(PauseState.UNPAUSED)
 
     def is_scheduler_paused(self) -> bool:
         """Return whether the scheduler is in any pause state."""
-        return self.scheduler.pause_state != PauseState.UNPAUSED
+        return any(
+            scheduler.pause_state != PauseState.UNPAUSED
+            for scheduler in self._all_schedulers()
+        )
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
         """Put the engine to sleep at the specified level.
@@ -1544,18 +1603,29 @@ class EngineCoreProc(EngineCore):
             )
 
             if shutdown_timeout == 0:
-                num_requests = self.scheduler.get_num_unfinished_requests()
+                num_requests = sum(
+                    scheduler.get_num_unfinished_requests()
+                    for scheduler in self._all_schedulers()
+                )
                 if num_requests > 0:
                     logger.info(
                         "[shutdown] EngineCore: aborting in-flight requests count=%d",
                         num_requests,
                     )
-                aborted_reqs = self.scheduler.finish_requests(
-                    None, RequestStatus.FINISHED_ABORTED
-                )
+                aborted_reqs = []
+                for scheduler in self._all_schedulers():
+                    aborted_reqs.extend(
+                        scheduler.finish_requests(
+                            None,
+                            RequestStatus.FINISHED_ABORTED,
+                        )
+                    )
                 self._send_abort_outputs(aborted_reqs)
             else:
-                num_requests = self.scheduler.get_num_unfinished_requests()
+                num_requests = sum(
+                    scheduler.get_num_unfinished_requests()
+                    for scheduler in self._all_schedulers()
+                )
                 if num_requests > 0:
                     logger.info(
                         "[shutdown] EngineCore: draining in-flight requests "
@@ -1971,13 +2041,19 @@ class EngineCoreProc(EngineCore):
             future.set_result(None)
 
         if mode == "abort":
-            aborted_reqs = self.scheduler.finish_requests(
-                None, RequestStatus.FINISHED_ABORTED
-            )
+            aborted_reqs = []
+            for scheduler in self._all_schedulers():
+                aborted_reqs.extend(
+                    scheduler.finish_requests(
+                        None,
+                        RequestStatus.FINISHED_ABORTED,
+                    )
+                )
             self._send_abort_outputs(aborted_reqs)
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
-        self.scheduler.set_pause_state(pause_state)
+        for scheduler in self._all_schedulers():
+            scheduler.set_pause_state(pause_state)
 
         if self._pause_complete():
             if clear_cache:

@@ -30,6 +30,7 @@ import weakref
 from collections import namedtuple
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
@@ -1384,11 +1385,25 @@ def _replace_active_groups(
 
 
 _TP: GroupCoordinator | None = None
+_TP_OVERRIDE: ContextVar[GroupCoordinator | None] = ContextVar(
+    "vllm_tp_group_override", default=None
+)
 
 
 def get_tp_group() -> GroupCoordinator:
+    if (group := _TP_OVERRIDE.get()) is not None:
+        return group
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
+
+
+@contextmanager
+def override_tp_group(group: GroupCoordinator):
+    token = _TP_OVERRIDE.set(group)
+    try:
+        yield
+    finally:
+        _TP_OVERRIDE.reset(token)
 
 
 _DCP: GroupCoordinator | None = None
