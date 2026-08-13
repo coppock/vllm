@@ -55,3 +55,41 @@ Two probe bugs worth knowing about, both fixed and both of which first presented
 deadlock: `torch.cuda.set_device()` binds per-thread and is **not** inherited by worker
 threads, and fixed-iteration loops of unequal step cost stop overlapping once the fast stream
 retires, diluting measured interference toward zero.
+
+## Update: the engine integration now works
+
+The layers listed as `MISSING` above are implemented and serving. Each TP worker holds one
+copy of the weights and two model-runner states; `EngineCore` runs two schedulers over
+matching KV partitions and routes by request priority (`priority < 0` -> latency engine).
+
+Verified on 8xB300 / Kimi-K3 / TP=8: both roles return correct output over repeated
+alternating requests, with the KV pool split 51.1 / 5.7 GiB out of an unchanged 56.8 GiB.
+
+### Known limits
+
+* **Execution is sequential** - the latency batch runs, then the throughput batch. Concurrent
+  execution across the two streams, which is the entire point of the architecture, is not
+  implemented. The probe numbers (1.02x latency p50, 87% throughput retention) therefore
+  remain a projection, not an end-to-end measurement.
+* **Requires `--no-async-scheduling`.** With async scheduling the engine drives
+  `step_with_batch_queue` rather than `step`, which is not patched.
+* **The secondary TP group bypasses the custom all-reduce**, whose single shared staging
+  buffer would corrupt under two concurrent forwards. Plain NCCL is correct but slower.
+* **A failed latency request kills the engine**, so this is not safe to leave serving.
+
+### Provenance
+
+Developed and verified against a vendor fork of vLLM (`20260803.dev23+g9d083cdd6`), not
+against this tree's `main`. The diff applies cleanly here, but "applies cleanly" is textual -
+it has **not** been run against upstream vLLM. `dual_engine.patch` is the original patch as
+generated on the verified tree.
+
+### The six defects, all found by running it
+
+1. `load_model()` side effects (`decode_query_len`) missing on the second runner
+2. `KVCacheConfig` shallow copy kept full tensor byte sizes -> 2x KV -> OOM
+3. async scheduling bypassed the patched `step()` entirely
+4. `WorkerWrapperBase.execute_model()` dropped the `role` argument
+5. `_init_kv_zero_meta()` not run for the latency runner
+6. `sample_tokens()` also needs the role - it is the second half of the same forward, so
+   sampling against the other runner found no pending batch and silently returned `None`

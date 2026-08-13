@@ -1,0 +1,604 @@
+From d87601319b08a45d7685d33c95b58123ce5a947a Mon Sep 17 00:00:00 2001
+From: coppock <patrick@gpuos.ai>
+Date: Thu, 13 Aug 2026 13:58:01 +0000
+Subject: [PATCH] Dual priority-stream execution: two engines, one process,
+ shared weights
+
+Each TP worker holds ONE copy of the weights and TWO model-runner states: a
+LATENCY role (high-priority CUDA stream, small KV reservation) and a THROUGHPUT
+role (default stream, the rest of the pool). EngineCore runs two schedulers over
+the matching KV partitions and routes by request priority (<0 -> latency).
+
+Shared weights are required, not an optimisation: weights plus non-torch memory
+are 193.75 GiB per GPU of a 267.69 GiB card, so two processes cannot both hold a
+copy.
+
+Verified serving on 8xB300 / Kimi-K3 / TP=8: both roles return correct output,
+routed by priority, over repeated alternating requests.
+
+Known limits:
+  * execution is SEQUENTIAL (latency batch, then throughput); concurrent
+    execution across the two streams is not implemented yet
+  * requires --no-async-scheduling: the async path uses step_with_batch_queue,
+    which is not patched
+  * secondary TP group bypasses the custom all-reduce (single shared staging
+    buffer would corrupt under two concurrent forwards)
+
+Six defects found by running it, each one layer deeper:
+  1. load_model() side effects (decode_query_len) missing on the second runner
+  2. KVCacheConfig shallow copy kept full tensor byte sizes -> 2x KV -> OOM
+  3. async scheduling bypassed the patched step() entirely
+  4. WorkerWrapperBase.execute_model() dropped the role argument
+  5. _init_kv_zero_meta() not run for the latency runner
+  6. sample_tokens() also needs the role - it is the second half of the same
+     forward, so sampling against the other runner found no batch and returned
+     None
+---
+ v1/engine/core.py                 |  87 +++++++++++-
+ v1/executor/multiproc_executor.py |  10 +-
+ v1/worker/dual_stream.py          | 220 ++++++++++++++++++++++++++++++
+ v1/worker/gpu_worker.py           |  87 +++++++++++-
+ v1/worker/worker_base.py          |   6 +-
+ 5 files changed, 397 insertions(+), 13 deletions(-)
+ create mode 100644 v1/worker/dual_stream.py
+
+diff --git a/v1/engine/core.py b/v1/engine/core.py
+index 476f53d..d464688 100644
+--- a/v1/engine/core.py
++++ b/v1/engine/core.py
+@@ -150,15 +150,39 @@ class EngineCore:
+             kv_cache_config, vllm_config
+         )
+ 
++        # Dual-stream: the workers carve their KV pool into a throughput and a latency
++        # partition, so the schedulers must be built over the MATCHING block counts or they
++        # would hand out block ids their runner has no memory for. The two partitions are
++        # separate tensors, so block id N in one is unrelated to block id N in the other.
++        from vllm.v1.worker import dual_stream as _ds
++
++        _thr_kv_cfg, _lat_kv_cfg = (kv_cache_config, None)
++        if _ds.enabled():
++            _thr_kv_cfg, _lat_kv_cfg = _ds.split_kv_cache_config(
++                kv_cache_config, _ds.latency_kv_fraction()
++            )
++
+         self.scheduler: SchedulerInterface = Scheduler(
+             vllm_config=vllm_config,
+-            kv_cache_config=kv_cache_config,
++            kv_cache_config=_thr_kv_cfg,
+             structured_output_manager=self.structured_output_manager,
+             include_finished_set=include_finished_set,
+             log_stats=self.log_stats,
+             block_size=scheduler_block_size,
+             hash_block_size=hash_block_size,
+         )
++        self.scheduler_lat: SchedulerInterface | None = None
++        if _lat_kv_cfg is not None:
++            self.scheduler_lat = Scheduler(
++                vllm_config=vllm_config,
++                kv_cache_config=_lat_kv_cfg,
++                structured_output_manager=self.structured_output_manager,
++                include_finished_set=include_finished_set,
++                log_stats=self.log_stats,
++                block_size=scheduler_block_size,
++                hash_block_size=hash_block_size,
++            )
++            logger.info("dual-stream: latency scheduler created")
+         self.use_spec_decode = vllm_config.speculative_config is not None
+         self.check_for_draft_tokens = (
+             self.use_spec_decode or vllm_config.model_config.is_diffusion
+@@ -468,7 +492,21 @@ class EngineCore:
+                 "Disabling ECTransfer for this request."
+             )
+ 
+-        self.scheduler.add_request(request)
++        _lat_ok = (
++            getattr(self, "scheduler_lat", None) is not None
++            and getattr(request, "priority", 0) is not None
++            and getattr(request, "priority", 0) < 0
++        )
++        logger.info("DSDBG add_request id=%s priority=%s -> %s",
++                    getattr(request, "request_id", "?"),
++                    getattr(request, "priority", None),
++                    "LATENCY" if _lat_ok else "throughput")
++        if _lat_ok:
++            # Negative priority marks a latency-critical request. vLLM already carries a
++            # per-request priority field, so routing needs no new API surface.
++            self.scheduler_lat.add_request(request)
++        else:
++            self.scheduler.add_request(request)
+         if request.abort_immediately:
+             # Immediately abort so the connector's request_finished hook runs
+             # to free any pre-admission KV-transfer resources.
+@@ -573,6 +611,18 @@ class EngineCore:
+         Overridden by the DP engine core; never throttles otherwise."""
+         return False
+ 
++
++    def _any_scheduler_has_requests(self) -> bool:
++        """Work exists if EITHER engine has it.
++
++        Without this, a latency-routed request is accepted and then starves: the busy loop
++        gates on the throughput scheduler and never calls step().
++        """
++        if self.scheduler.has_requests():
++            return True
++        sched_lat = getattr(self, "scheduler_lat", None)
++        return sched_lat is not None and sched_lat.has_requests()
++
+     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+         """Schedule, execute, and make output.
+ 
+@@ -582,8 +632,29 @@ class EngineCore:
+ 
+         # Check for any requests remaining in the scheduler - unfinished,
+         # or finished and not yet removed from the batch.
++        lat_outputs: dict[int, EngineCoreOutputs] = {}
++        sched_lat = getattr(self, "scheduler_lat", None)
++        if sched_lat is not None and sched_lat.has_requests():
++            logger.info("DSDBG step: latency scheduler has requests")
++            lat_sched_out = sched_lat.schedule()
++            logger.info("DSDBG step: latency scheduled tokens=%s",
++                        getattr(lat_sched_out, "total_num_scheduled_tokens", "?"))
++            lat_future = self.model_executor.execute_model(
++                lat_sched_out, non_block=True, role="latency"
++            )
++            lat_grammar = sched_lat.get_grammar_bitmask(lat_sched_out)
++            lat_model_out = lat_future.result()
++            if lat_model_out is None:
++                lat_model_out = self.model_executor.sample_tokens(
++                    lat_grammar, role="latency"
++                )
++            lat_outputs = sched_lat.update_from_output(lat_sched_out, lat_model_out)
++            logger.info("DSDBG step: latency outputs clients=%s total=%s",
++                        list(lat_outputs.keys()),
++                        sum(len(o.outputs) for o in lat_outputs.values()))
++
+         if not self.scheduler.has_requests():
+-            return {}, False
++            return lat_outputs, bool(lat_outputs)
+         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+@@ -603,6 +674,12 @@ class EngineCore:
+         )
+         self._attach_iteration_details(engine_core_outputs, iteration_details)
+ 
++        for _cid, _out in lat_outputs.items():
++            if _cid in engine_core_outputs:
++                engine_core_outputs[_cid].outputs.extend(_out.outputs)
++            else:
++                engine_core_outputs[_cid] = _out
++
+         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+ 
+     def post_step(self, model_executed: bool) -> None:
+@@ -1347,7 +1424,7 @@ class EngineCoreProc(EngineCore):
+         """Returns true if the engine should be stepped."""
+         return (
+             self.engines_running
+-            or self.scheduler.has_requests()
++            or self._any_scheduler_has_requests()
+             or bool(self.batch_queue)
+         )
+ 
+@@ -1410,7 +1487,7 @@ class EngineCoreProc(EngineCore):
+         # If no model execution happened but there is still scheduler work
+         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
+         # the GIL briefly to allow background transfer threads to make progress.
+-        if not model_executed and self.scheduler.has_requests():
++        if not model_executed and self._any_scheduler_has_requests():
+             time.sleep(0.001)
+ 
+         return model_executed
+diff --git a/v1/executor/multiproc_executor.py b/v1/executor/multiproc_executor.py
+index 0a3a6d1..718ac85 100644
+--- a/v1/executor/multiproc_executor.py
++++ b/v1/executor/multiproc_executor.py
+@@ -319,11 +319,12 @@ class MultiprocExecutor(Executor):
+             self.failure_callback = callback
+ 
+     def execute_model(  # type: ignore[override]
+-        self, scheduler_output: SchedulerOutput, non_block: bool = False
++        self, scheduler_output: SchedulerOutput, non_block: bool = False,
++        role: str | None = None,
+     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+         return self.collective_rpc(
+             "execute_model",
+-            args=(scheduler_output,),
++            args=(scheduler_output, role) if role is not None else (scheduler_output,),
+             unique_reply_rank=self.output_rank,
+             non_block=non_block,
+             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+@@ -331,11 +332,12 @@ class MultiprocExecutor(Executor):
+         )
+ 
+     def sample_tokens(  # type: ignore[override]
+-        self, grammar_output: GrammarOutput | None, non_block: bool = False
++        self, grammar_output: GrammarOutput | None, non_block: bool = False,
++        role: str | None = None,
+     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
+         return self.collective_rpc(
+             "sample_tokens",
+-            args=(grammar_output,),
++            args=(grammar_output, role) if role is not None else (grammar_output,),
+             unique_reply_rank=self.output_rank,
+             non_block=non_block,
+             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+diff --git a/v1/worker/dual_stream.py b/v1/worker/dual_stream.py
+new file mode 100644
+index 0000000..e559338
+--- /dev/null
++++ b/v1/worker/dual_stream.py
+@@ -0,0 +1,220 @@
++"""Dual priority-stream execution: two engines, one process, one copy of the weights.
++
++Enabled with VLLM_DUAL_STREAM=1. Off by default and inert when off.
++
++Each TP worker holds ONE set of model weights and TWO model-runner states:
++
++    LATENCY     small batch, high-priority CUDA stream, small KV reservation
++    THROUGHPUT  the normal engine, default-priority stream, the rest of the KV pool
++
++Sharing weights is a requirement, not an optimisation: for a large MoE the weights dominate
++device memory (193.75 GiB per GPU of a 267.69 GiB card on the model this was built against),
++so two independent processes cannot both hold a copy. One copy plus two runner states can.
++
++Two things must be per-role or the two forwards corrupt each other:
++  * the TP communicator - vLLM resolves it through a module-level singleton, which is fine
++    for one in-flight forward and undefined for two;
++  * the model-runner state - input batches, block tables and persistent buffers are mutable
++    per-instance, so the runners must be distinct objects even though `.model` is shared.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++import os
++import threading
++
++logger = logging.getLogger(__name__)
++
++LATENCY = "latency"
++THROUGHPUT = "throughput"
++
++_thread_state = threading.local()
++_streams: dict = {}
++_tp_groups: dict = {}
++
++
++def enabled() -> bool:
++    return os.environ.get("VLLM_DUAL_STREAM", "0") == "1"
++
++
++def latency_kv_fraction() -> float:
++    """Share of KV blocks reserved for the latency engine.
++
++    Small on purpose: the latency engine runs a handful of sequences, so giving it more only
++    steals capacity from the throughput engine, which is the side that actually converts KV
++    into tokens.
++    """
++    return float(os.environ.get("VLLM_DUAL_STREAM_LATENCY_KV_FRAC", "0.10"))
++
++
++def _patch_tp_group_resolution() -> None:
++    from vllm.distributed import parallel_state as ps
++
++    if getattr(ps, "_dual_stream_patched", False):
++        return
++    original = ps.get_tp_group
++
++    def get_tp_group_threadaware():
++        role = getattr(_thread_state, "role", None)
++        if role is not None:
++            g = _tp_groups.get(role)
++            if g is not None:
++                return g
++        return original()
++
++    ps.get_tp_group = get_tp_group_threadaware
++    ps._dual_stream_original_get_tp_group = original
++    ps._dual_stream_patched = True
++
++
++class _SecondaryTPGroup:
++    """Primary GroupCoordinator, but collectives routed to a second NCCL communicator.
++
++    Deliberately bypasses vLLM's custom all-reduce: that path uses one preallocated
++    signal/staging buffer per process, so two concurrent forwards would corrupt each other's.
++    Plain NCCL is correct but slower; per-role custom-allreduce buffers would win it back.
++    """
++
++    def __init__(self, primary, device_group):
++        self._primary = primary
++        self.device_group = device_group
++
++    def __getattr__(self, name):
++        return getattr(self._primary, name)
++
++    def all_reduce(self, input_):
++        import torch.distributed as dist
++
++        if input_.numel() == 0:
++            return input_
++        dist.all_reduce(input_, group=self.device_group)
++        return input_
++
++
++def init_worker(model_runner_factory, primary_runner):
++    """Build the latency-role runner, communicator and streams inside a TP worker.
++
++    `model_runner_factory` returns a fresh, unloaded runner; its `.model` is then pointed at
++    the primary runner's weights so nothing is loaded twice.
++    """
++    import torch
++    import torch.distributed as dist
++    from vllm.distributed import parallel_state as ps
++
++    if not enabled() or LATENCY in _tp_groups:
++        return _tp_groups.get(LATENCY), None
++
++    _patch_tp_group_resolution()
++    primary = ps._dual_stream_original_get_tp_group()
++    _tp_groups[THROUGHPUT] = primary
++
++    # new_group is itself collective: every rank must reach it, in the same order.
++    ranks = dist.get_process_group_ranks(primary.device_group)
++    secondary = dist.new_group(ranks=ranks, backend="nccl")
++    _tp_groups[LATENCY] = _SecondaryTPGroup(primary, secondary)
++
++    least, greatest = torch.cuda.Stream.priority_range()
++    _streams[LATENCY] = torch.cuda.Stream(priority=greatest)
++    _streams[THROUGHPUT] = torch.cuda.Stream(priority=least)
++
++    latency_runner = model_runner_factory()
++
++    # Assigning `.model` is NOT enough: load_model() also derives per-runner state (e.g.
++    # decode_query_len, speculator wiring, memory accounting) and a runner missing it fails
++    # later in initialize_kv_cache. So run the real load_model, but swap the loader for one
++    # that hands back the already-resident module - all side effects, zero disk reads.
++    import importlib
++    import sys as _sys
++
++    mod = _sys.modules[type(latency_runner).__module__]
++    original_get_loader = mod.get_model_loader
++
++    class _SharedWeightLoader:
++        def __init__(self, model):
++            self._model = model
++
++        def load_model(self, *args, **kwargs):
++            return self._model
++
++        def __getattr__(self, name):
++            return getattr(original_get_loader(_LOAD_CFG[0]), name)
++
++    _LOAD_CFG = [latency_runner.vllm_config.load_config]
++    mod.get_model_loader = lambda *a, **k: _SharedWeightLoader(primary_runner.model)
++    try:
++        latency_runner.load_model()
++    finally:
++        mod.get_model_loader = original_get_loader
++    logger.info(
++        "dual-stream: latency runner ready (secondary TP comm over ranks %s, "
++        "stream priorities lat=%d thr=%d)",
++        ranks, greatest, least,
++    )
++    return _tp_groups[LATENCY], latency_runner
++
++
++def split_kv_cache_config(kv_cache_config, fraction: float):
++    """(throughput_config, latency_config) carved out of one pool.
++
++    num_blocks alone is NOT enough. KVCacheTensor.size is a byte count computed from the
++    original block count, and initialize_kv_cache allocates from THAT. A shallow copy with
++    only num_blocks changed makes each runner allocate the whole pool, which OOMs at 2x.
++    So the per-tensor byte sizes are rescaled to match each side's block count.
++    """
++    import copy
++
++    total = kv_cache_config.num_blocks
++    lat_blocks = max(1, int(total * fraction))
++    thr_blocks = total - lat_blocks
++
++    def carve(n_blocks):
++        cfg = copy.deepcopy(kv_cache_config)
++        cfg.num_blocks = n_blocks
++        for t in cfg.kv_cache_tensors:
++            if getattr(t, "block_stride", 0):
++                # Packed layout: bytes are exactly stride * blocks.
++                t.size = t.block_stride * n_blocks
++            else:
++                # Otherwise scale proportionally, keeping the per-block granularity intact.
++                per_block = t.size // max(1, total)
++                t.size = per_block * n_blocks
++        return cfg
++
++    thr, lat = carve(thr_blocks), carve(lat_blocks)
++    thr_bytes = sum(t.size for t in thr.kv_cache_tensors)
++    lat_bytes = sum(t.size for t in lat.kv_cache_tensors)
++    orig_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
++    logger.info(
++        "dual-stream: KV split -> throughput %d blocks (%.1f GiB), latency %d blocks "
++        "(%.1f GiB); original %.1f GiB",
++        thr_blocks, thr_bytes / 2**30, lat_blocks, lat_bytes / 2**30,
++        orig_bytes / 2**30,
++    )
++    return thr, lat
++
++
++@contextlib.contextmanager
++def on_stream(role: str):
++    """Execute a forward as `role`: its CUDA stream AND its TP communicator.
++
++    Both together. Running on the latency stream while collectives go to the throughput
++    communicator is exactly the race this module exists to prevent.
++    """
++    import torch
++
++    if not enabled() or role not in _streams:
++        yield None
++        return
++    prev = getattr(_thread_state, "role", None)
++    _thread_state.role = role
++    try:
++        with torch.cuda.stream(_streams[role]):
++            yield _streams[role]
++    finally:
++        _thread_state.role = prev
++
++
++def stream(role: str):
++    return _streams.get(role)
+diff --git a/v1/worker/gpu_worker.py b/v1/worker/gpu_worker.py
+index ca63e0a..c7043d3 100644
+--- a/v1/worker/gpu_worker.py
++++ b/v1/worker/gpu_worker.py
+@@ -425,6 +425,22 @@ class Worker(WorkerBase):
+         ):
+             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+ 
++        # Dual-stream: build the latency-role runner AFTER weights exist, pointing it at the
++        # same nn.Module. Runner state (input batch, block tables, buffers) must be distinct
++        # per role or two concurrent forwards corrupt each other; the weights must not be.
++        from vllm.v1.worker import dual_stream as _ds
++
++        self.dual_stream_runner = None
++        if _ds.enabled():
++            def _make_runner():
++                if self.use_v2_model_runner:
++                    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as _R
++                else:
++                    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as _R
++                return _R(self.vllm_config, self.device)
++
++            _, self.dual_stream_runner = _ds.init_worker(_make_runner, self.model_runner)
++
+         if self.vllm_config.weight_transfer_config is not None:
+             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+                 self.vllm_config.weight_transfer_config,
+@@ -645,8 +661,18 @@ class Worker(WorkerBase):
+         # related to kv cache connector (e.g. kv cache sharing layers).
+         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+ 
+-        with self._maybe_get_memory_pool_context(tag="kv_cache"):
+-            self.model_runner.initialize_kv_cache(kv_cache_config)
++        from vllm.v1.worker import dual_stream as _ds
++
++        if _ds.enabled() and getattr(self, "dual_stream_runner", None) is not None:
++            thr_cfg, lat_cfg = _ds.split_kv_cache_config(
++                kv_cache_config, _ds.latency_kv_fraction()
++            )
++            with self._maybe_get_memory_pool_context(tag="kv_cache"):
++                self.model_runner.initialize_kv_cache(thr_cfg)
++                self.dual_stream_runner.initialize_kv_cache(lat_cfg)
++        else:
++            with self._maybe_get_memory_pool_context(tag="kv_cache"):
++                self.model_runner.initialize_kv_cache(kv_cache_config)
+ 
+         if self.model_config.enable_return_routed_experts:
+             self.model_runner.init_routed_experts_capturer()
+@@ -658,9 +684,31 @@ class Worker(WorkerBase):
+             self.model_runner, "_init_kv_zero_meta"
+         ):
+             self.model_runner._init_kv_zero_meta()
++            # The latency runner has its own KV tensors, so it needs its own zeroing
++            # metadata; without it update_requests asserts on a null kv_block_zeroer.
++            ds_runner = getattr(self, "dual_stream_runner", None)
++            if ds_runner is not None and hasattr(ds_runner, "_init_kv_zero_meta"):
++                ds_runner._init_kv_zero_meta()
++
+ 
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> CompilationTimes:
++        times = self._compile_or_warm_up_one()
++        ds_runner = getattr(self, "dual_stream_runner", None)
++        if ds_runner is not None:
++            from vllm.v1.worker import dual_stream as _ds
++
++            logger.info("dual-stream: warming up latency runner")
++            saved = self.model_runner
++            self.model_runner = ds_runner
++            try:
++                with _ds.on_stream(_ds.LATENCY):
++                    self._compile_or_warm_up_one()
++            finally:
++                self.model_runner = saved
++        return times
++
++    def _compile_or_warm_up_one(self) -> CompilationTimes:
+         warmup_sizes: list[int] = []
+ 
+         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+@@ -994,13 +1042,46 @@ class Worker(WorkerBase):
+     @torch.inference_mode()
+     @with_gpu_sync_check
+     def sample_tokens(
+-        self, grammar_output: "GrammarOutput | None"
++        self, grammar_output: "GrammarOutput | None", role: str | None = None
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
++        from vllm.v1.worker import dual_stream as _ds
++
++        if role == _ds.LATENCY and getattr(self, "dual_stream_runner", None) is not None:
++            saved = self.model_runner
++            self.model_runner = self.dual_stream_runner
++            try:
++                with _ds.on_stream(_ds.LATENCY):
++                    return self.model_runner.sample_tokens(grammar_output)
++            finally:
++                self.model_runner = saved
++        if role == _ds.THROUGHPUT and _ds.enabled():
++            with _ds.on_stream(_ds.THROUGHPUT):
++                return self.model_runner.sample_tokens(grammar_output)
+         return self.model_runner.sample_tokens(grammar_output)
+ 
+     @torch.inference_mode()
+     @with_gpu_sync_check
+     def execute_model(
++        self, scheduler_output: "SchedulerOutput", role: str | None = None
++    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
++        # Dual-stream: run this batch as `role` - its runner, its CUDA stream, its TP
++        # communicator. Default (None) is the unmodified single-engine path.
++        from vllm.v1.worker import dual_stream as _ds
++
++        if role == _ds.LATENCY and getattr(self, "dual_stream_runner", None) is not None:
++            _saved = self.model_runner
++            self.model_runner = self.dual_stream_runner
++            try:
++                with _ds.on_stream(_ds.LATENCY):
++                    return self._execute_model_inner(scheduler_output)
++            finally:
++                self.model_runner = _saved
++        if role == _ds.THROUGHPUT and _ds.enabled():
++            with _ds.on_stream(_ds.THROUGHPUT):
++                return self._execute_model_inner(scheduler_output)
++        return self._execute_model_inner(scheduler_output)
++
++    def _execute_model_inner(
+         self, scheduler_output: "SchedulerOutput"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+         # ensure any previous non-blocking PP sends are complete
+diff --git a/v1/worker/worker_base.py b/v1/worker/worker_base.py
+index 9381d71..e210c17 100644
+--- a/v1/worker/worker_base.py
++++ b/v1/worker/worker_base.py
+@@ -344,10 +344,14 @@ class WorkerWrapperBase:
+             )
+ 
+     def execute_model(
+-        self, scheduler_output: SchedulerOutput
++        self, scheduler_output: SchedulerOutput, role: str | None = None
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+         self._apply_mm_cache(scheduler_output)
+ 
++        # Dual-stream: forward the role only when set, so the single-engine RPC signature
++        # and behaviour are byte-identical when the feature is off.
++        if role is not None:
++            return self.worker.execute_model(scheduler_output, role)
+         return self.worker.execute_model(scheduler_output)
+ 
+     def reset_mm_cache(self) -> None:
+-- 
+2.43.0
+

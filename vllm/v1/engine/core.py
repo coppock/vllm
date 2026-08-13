@@ -158,15 +158,39 @@ class EngineCore:
             kv_cache_config, vllm_config
         )
 
+        # Dual-stream: the workers carve their KV pool into a throughput and a latency
+        # partition, so the schedulers must be built over the MATCHING block counts or they
+        # would hand out block ids their runner has no memory for. The two partitions are
+        # separate tensors, so block id N in one is unrelated to block id N in the other.
+        from vllm.v1.worker import dual_stream as _ds
+
+        _thr_kv_cfg, _lat_kv_cfg = (kv_cache_config, None)
+        if _ds.enabled():
+            _thr_kv_cfg, _lat_kv_cfg = _ds.split_kv_cache_config(
+                kv_cache_config, _ds.latency_kv_fraction()
+            )
+
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
+            kv_cache_config=_thr_kv_cfg,
             structured_output_manager=self.structured_output_manager,
             include_finished_set=include_finished_set,
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        self.scheduler_lat: SchedulerInterface | None = None
+        if _lat_kv_cfg is not None:
+            self.scheduler_lat = Scheduler(
+                vllm_config=vllm_config,
+                kv_cache_config=_lat_kv_cfg,
+                structured_output_manager=self.structured_output_manager,
+                include_finished_set=include_finished_set,
+                log_stats=self.log_stats,
+                block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
+            )
+            logger.info("dual-stream: latency scheduler created")
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -473,7 +497,21 @@ class EngineCore:
                 "Disabling ECTransfer for this request."
             )
 
-        self.scheduler.add_request(request)
+        _lat_ok = (
+            getattr(self, "scheduler_lat", None) is not None
+            and getattr(request, "priority", 0) is not None
+            and getattr(request, "priority", 0) < 0
+        )
+        logger.info("DSDBG add_request id=%s priority=%s -> %s",
+                    getattr(request, "request_id", "?"),
+                    getattr(request, "priority", None),
+                    "LATENCY" if _lat_ok else "throughput")
+        if _lat_ok:
+            # Negative priority marks a latency-critical request. vLLM already carries a
+            # per-request priority field, so routing needs no new API surface.
+            self.scheduler_lat.add_request(request)
+        else:
+            self.scheduler.add_request(request)
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs
             # to free any pre-admission KV-transfer resources.
@@ -578,6 +616,18 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+
+    def _any_scheduler_has_requests(self) -> bool:
+        """Work exists if EITHER engine has it.
+
+        Without this, a latency-routed request is accepted and then starves: the busy loop
+        gates on the throughput scheduler and never calls step().
+        """
+        if self.scheduler.has_requests():
+            return True
+        sched_lat = getattr(self, "scheduler_lat", None)
+        return sched_lat is not None and sched_lat.has_requests()
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -587,8 +637,29 @@ class EngineCore:
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        lat_outputs: dict[int, EngineCoreOutputs] = {}
+        sched_lat = getattr(self, "scheduler_lat", None)
+        if sched_lat is not None and sched_lat.has_requests():
+            logger.info("DSDBG step: latency scheduler has requests")
+            lat_sched_out = sched_lat.schedule()
+            logger.info("DSDBG step: latency scheduled tokens=%s",
+                        getattr(lat_sched_out, "total_num_scheduled_tokens", "?"))
+            lat_future = self.model_executor.execute_model(
+                lat_sched_out, non_block=True, role="latency"
+            )
+            lat_grammar = sched_lat.get_grammar_bitmask(lat_sched_out)
+            lat_model_out = lat_future.result()
+            if lat_model_out is None:
+                lat_model_out = self.model_executor.sample_tokens(
+                    lat_grammar, role="latency"
+                )
+            lat_outputs = sched_lat.update_from_output(lat_sched_out, lat_model_out)
+            logger.info("DSDBG step: latency outputs clients=%s total=%s",
+                        list(lat_outputs.keys()),
+                        sum(len(o.outputs) for o in lat_outputs.values()))
+
         if not self.scheduler.has_requests():
-            return {}, False
+            return lat_outputs, bool(lat_outputs)
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
@@ -607,6 +678,12 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+
+        for _cid, _out in lat_outputs.items():
+            if _cid in engine_core_outputs:
+                engine_core_outputs[_cid].outputs.extend(_out.outputs)
+            else:
+                engine_core_outputs[_cid] = _out
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -1361,7 +1438,7 @@ class EngineCoreProc(EngineCore):
         """Returns true if the engine should be stepped."""
         return (
             self.engines_running
-            or self.scheduler.has_requests()
+            or self._any_scheduler_has_requests()
             or bool(self.batch_queue)
         )
 
@@ -1441,7 +1518,7 @@ class EngineCoreProc(EngineCore):
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
-        if not model_executed and self.scheduler.has_requests():
+        if not model_executed and self._any_scheduler_has_requests():
             time.sleep(0.001)
 
         return model_executed

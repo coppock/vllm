@@ -344,10 +344,14 @@ class WorkerWrapperBase:
             )
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self, scheduler_output: SchedulerOutput, role: str | None = None
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         self._apply_mm_cache(scheduler_output)
 
+        # Dual-stream: forward the role only when set, so the single-engine RPC signature
+        # and behaviour are byte-identical when the feature is off.
+        if role is not None:
+            return self.worker.execute_model(scheduler_output, role)
         return self.worker.execute_model(scheduler_output)
 
     def reset_mm_cache(self) -> None:
