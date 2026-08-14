@@ -78,7 +78,13 @@ def _load_records(path: Path) -> list[dict[str, Any]]:
 
 
 def _summary(rows: list[dict[str, Any]], elapsed_s: float) -> dict[str, Any]:
-    ok = [row for row in rows if row["status"] == 200]
+    ok = [
+        row
+        for row in rows
+        if row["status"] == 200
+        and row["error"] is None
+        and row["input_tokens"] is not None
+    ]
     output_tokens = sum(row.get("output_tokens") or 0 for row in ok)
     input_tokens = sum(row.get("input_tokens") or 0 for row in ok)
     return {
@@ -172,6 +178,8 @@ async def _send_one(
     if usage:
         result["input_tokens"] = usage.get("prompt_tokens")
         result["output_tokens"] = usage.get("completion_tokens")
+    elif result["status"] == 200 and result["error"] is None:
+        result["error"] = "stream ended without usage"
     result["finish_reason"] = finish_reason
     print(
         f"[{index:02d}] {tier:10s} status={result['status']} "

@@ -1106,6 +1106,12 @@ class Worker(WorkerBase):
                     output = runner.execute_model(scheduler_output)
                     if output is None:
                         output = runner.sample_tokens(grammar_output)
+                    # MultiprocExecutor materializes a top-level async output
+                    # before pickling it, but execute_model_dual returns a
+                    # tuple. Resolve each role's CUDA-event-bearing wrapper in
+                    # its own thread before constructing that tuple.
+                    if isinstance(output, AsyncModelRunnerOutput):
+                        output = output.get_output()
                     _ds.finish_collectives(role)
                 outputs[role] = output
             except BaseException as exc:

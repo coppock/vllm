@@ -1268,7 +1268,7 @@ index 0000000..a3b0c1a
 +    finally:
 +        _thread_state.role = prev
 diff --git a/v1/worker/gpu_worker.py b/v1/worker/gpu_worker.py
-index ca63e0a..941520a 100644
+index ca63e0a..18038bd 100644
 --- a/v1/worker/gpu_worker.py
 +++ b/v1/worker/gpu_worker.py
 @@ -9,7 +9,7 @@ from collections.abc import Callable
@@ -1389,7 +1389,7 @@ index ca63e0a..941520a 100644
  
      def get_model(self) -> nn.Module:
          return self.model_runner.get_model()
-@@ -991,16 +1060,134 @@ class Worker(WorkerBase):
+@@ -991,16 +1060,140 @@ class Worker(WorkerBase):
              )
          return self.profiler.annotate_context_manager(annotation)
  
@@ -1416,6 +1416,12 @@ index ca63e0a..941520a 100644
 +                    output = runner.execute_model(scheduler_output)
 +                    if output is None:
 +                        output = runner.sample_tokens(grammar_output)
++                    # MultiprocExecutor materializes a top-level async output
++                    # before pickling it, but execute_model_dual returns a
++                    # tuple. Resolve each role's CUDA-event-bearing wrapper in
++                    # its own thread before constructing that tuple.
++                    if isinstance(output, AsyncModelRunnerOutput):
++                        output = output.get_output()
 +                    _ds.finish_collectives(role)
 +                outputs[role] = output
 +            except BaseException as exc:
