@@ -13,9 +13,10 @@ to the throughput scheduler.
 ## Status
 
 Concurrent execution is working end to end with tensor parallelism. It was
-validated on vLLM 0.27.1 with Qwen3.5-0.8B at TP=4 on four NVIDIA A10Gs. The
-durable upstream branch also passes its focused unit tests, Ruff, formatting,
-mypy, repository policy hooks, Python compilation, and `git diff --check`.
+validated on vLLM 0.27.1 with Qwen3.5-0.8B at TP=4 on four NVIDIA A10Gs and
+four NVIDIA B300 SXM6 AC GPUs. The durable upstream branch also passes its
+focused unit tests, Ruff, formatting, mypy, repository policy hooks, Python
+compilation, and `git diff --check`.
 
 An earlier sequential version was validated with Kimi-K3 at TP=8 on eight
 B300s. The current concurrent vendor patch is ready, but has not yet been run
@@ -86,6 +87,8 @@ connectors, and parallel modes other than tensor parallelism.
 
 ## Validation results
 
+### A10G
+
 The TP=4 stress workload used eight throughput requests at 160 output tokens
 and four staggered latency requests at 16 output tokens.
 
@@ -103,6 +106,33 @@ running blocks. On this small A10G model, mixed latency was about 2.7x solo and
 throughput retained about 57% of its solo rate. The B300/Kimi-K3 workload must
 be benchmarked before drawing production capacity conclusions.
 
+### B300
+
+The same workload was repeated on four NVIDIA B300 SXM6 AC GPUs with the
+PyPI vLLM 0.27.1 overlay. The mixed latency requests were injected at 1.00,
+1.15, 1.30, and 1.45 seconds after the throughput batch started.
+
+| Workload | Result |
+| --- | ---: |
+| Throughput only | 1,280 output tokens in 4.506 s, 284.05 tok/s |
+| Latency only | completions at 0.481, 0.941, 1.425, 1.885 s |
+| Mixed, repeated run | request latencies of 1.148, 2.140, 3.126, 4.114 s |
+| Mixed, repeated run | latency completions at 2.150, 3.291, 4.426, 5.565 s |
+| Mixed, repeated run | throughput requests completed in 6.935-6.962 s |
+| Mixed, repeated run | 193.06 combined tok/s; no NCCL races or engine errors |
+
+The recorded warm-ups and workloads produced 38 HTTP 200 completions with their
+exact requested output-token counts. Both mixed runs completed every latency
+request while the throughput requests were still active, demonstrating the
+intended two-scheduler overlap. `NCCL_LAUNCH_RACE_FATAL=1` remained enabled
+throughout; the final log had zero launch-race messages, tracebacks, or engine
+failures, and all eight GPUs reported zero volatile corrected and uncorrected
+ECC errors.
+
+These are functional results for a small model on four of the host's eight
+GPUs, not Kimi-K3 capacity results. Kimi-K3 still needs a dedicated production
+benchmark on a host with the model available.
+
 ## Files
 
 | File | Purpose |
@@ -116,6 +146,7 @@ be benchmarked before drawing production capacity conclusions.
 | `vllm/v1/attention/backends/flashinfer.py` | Separate latency FlashInfer workspace. |
 | `dual_engine.patch` | Current combined patch for vendor vLLM `20260803.dev23+g9d083cdd6`. |
 | `dual_stream_probe.py` | Standalone CUDA/NCCL feasibility benchmark. |
+| `stress_client.py` | Reproducible throughput-only, latency-only, and mixed validation workload. |
 
 `vllm_dual_stream.py` is retained only as a historical overlay from the first
 prototype. The in-tree implementation above is authoritative.
