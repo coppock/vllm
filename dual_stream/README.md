@@ -18,9 +18,11 @@ four NVIDIA B300 SXM6 AC GPUs. The durable upstream branch also passes its
 focused unit tests, Ruff, formatting, mypy, repository policy hooks, Python
 compilation, and `git diff --check`.
 
-An earlier sequential version was validated with Kimi-K3 at TP=8 on eight
-B300s. The current concurrent vendor patch is ready, but has not yet been run
-with Kimi-K3.
+The concurrent vendor patch was also functionally validated with Kimi-K3 at
+TP=8 on eight B300s using a 62-request production Resolve trace. It completed
+every request without a collective timeout or NCCL race. The tested
+batch-size-1 latency configuration was substantially slower than stock vLLM,
+so it is not production-ready; see the Kimi-K3 results below.
 
 ## How it works
 
@@ -130,8 +132,30 @@ failures, and all eight GPUs reported zero volatile corrected and uncorrected
 ECC errors.
 
 These are functional results for a small model on four of the host's eight
-GPUs, not Kimi-K3 capacity results. Kimi-K3 still needs a dedicated production
-benchmark on a host with the model available.
+GPUs, not Kimi-K3 capacity results. The dedicated Kimi-K3 run follows.
+
+### Kimi-K3 on eight B300s
+
+A production Resolve slice with 47 throughput requests and 15 latency requests
+was replayed at its original 224.269-second arrival timing. Outputs were capped
+at 64 tokens so the test measured scheduling behavior rather than 20,000-token
+generations. Both stock and dual runs completed all 62 requests and processed
+the same 7,754,855 input tokens without engine errors.
+
+| Metric | Stock baseline | Dual engine |
+| --- | ---: | ---: |
+| Total elapsed | 237.787 s | 386.027 s |
+| Output throughput | 16.502 tok/s | 10.178 tok/s |
+| Server mean TTFT, all requests | 3.697 s | 33.378 s |
+| Latency E2E p50 / p95 | 14.547 / 43.640 s | 141.734 / 194.931 s |
+| Throughput E2E p50 / p95 | 14.333 / 53.116 s | 41.863 / 78.418 s |
+
+The dual run was functionally correct but slower. Its latency scheduler limit
+of one serialized a burst that stock vLLM co-batched, while disabling K3's
+process-global fused all-reduce path to avoid concurrent deadlock imposed a
+large throughput cost. Role-safe fused collectives and a latency batch-size
+sweep are required before another production A/B. Full methodology and raw
+results are in [`results/k3-resolve-20260814`](results/k3-resolve-20260814/).
 
 ## Files
 

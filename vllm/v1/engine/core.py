@@ -706,7 +706,10 @@ class EngineCore:
         if not thr_has_requests:
             return lat_outputs, lat_model_executed
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        throughput_role = "throughput" if sched_lat is not None else None
+        future = self.model_executor.execute_model(
+            scheduler_output, non_block=True, role=throughput_role
+        )
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -714,7 +717,9 @@ class EngineCore:
         ):
             model_output = future.result()
             if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+                model_output = self.model_executor.sample_tokens(
+                    grammar_output, role=throughput_role
+                )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

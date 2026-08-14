@@ -3,7 +3,8 @@
 """Base class for attention-like layers."""
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, ClassVar
+from weakref import ReferenceType, ref
 
 import torch
 
@@ -23,6 +24,40 @@ class AttentionLayerBase(ABC):
 
     impl: "AttentionImpl"
     supports_dcp: bool = True
+    _dual_stream_kv_registry: ClassVar[
+        dict[
+            tuple[str, str],
+            tuple[bool, ReferenceType[Any] | tuple[ReferenceType[Any], ...]],
+        ]
+    ] = {}
+
+    def _dual_stream_kv_cache_key(self) -> str | None:
+        """Return the stable name used by the model's forward context."""
+        return getattr(self, "layer_name", None) or getattr(self, "prefix", None)
+
+    @staticmethod
+    def _make_dual_stream_kv_ref(
+        value: Any,
+    ) -> tuple[bool, ReferenceType[Any] | tuple[ReferenceType[Any], ...]] | None:
+        if isinstance(value, torch.Tensor):
+            return False, ref(value)
+        if isinstance(value, tuple) and all(isinstance(v, torch.Tensor) for v in value):
+            return True, tuple(ref(v) for v in value)
+        return None
+
+    @staticmethod
+    def _resolve_dual_stream_kv_ref(
+        cache_ref: tuple[bool, ReferenceType[Any] | tuple[ReferenceType[Any], ...]],
+    ) -> Any | None:
+        is_tuple, refs = cache_ref
+        if not is_tuple:
+            assert isinstance(refs, ReferenceType)
+            return refs()
+        assert isinstance(refs, tuple)
+        values = tuple(cache_ref() for cache_ref in refs)
+        if any(value is None for value in values):
+            return None
+        return values
 
     @property
     def kv_cache(self) -> Any:
@@ -38,6 +73,19 @@ class AttentionLayerBase(ABC):
         role_caches = getattr(self, "_dual_stream_kv_caches", None)
         if role is not None and role_caches is not None and role in role_caches:
             return role_caches[role]
+        # Some pluggable hybrid layers execute through a runtime module instance
+        # distinct from the object registered in static_forward_context. Resolve
+        # those through the stable layer name without retaining cache tensors
+        # after their owning model is released.
+        layer_key = self._dual_stream_kv_cache_key()
+        if role is not None and layer_key is not None:
+            registry_key = (layer_key, role)
+            cache_ref = AttentionLayerBase._dual_stream_kv_registry.get(registry_key)
+            if cache_ref is not None:
+                value = self._resolve_dual_stream_kv_ref(cache_ref)
+                if value is not None:
+                    return value
+                AttentionLayerBase._dual_stream_kv_registry.pop(registry_key, None)
         if hasattr(self, "_kv_cache"):
             return self._kv_cache
         raise AttributeError("KV cache has not been bound")
@@ -55,6 +103,10 @@ class AttentionLayerBase(ABC):
             role_caches = {}
             self._dual_stream_kv_caches = role_caches
         role_caches[role] = value
+        layer_key = self._dual_stream_kv_cache_key()
+        cache_ref = self._make_dual_stream_kv_ref(value)
+        if layer_key is not None and cache_ref is not None:
+            AttentionLayerBase._dual_stream_kv_registry[(layer_key, role)] = cache_ref
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         """Bind the allocated KV cache tensor to this layer.

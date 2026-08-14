@@ -142,6 +142,26 @@ def test_kv_cache_binding_is_isolated_by_role():
         assert layer.kv_cache is throughput
 
 
+def test_hybrid_kv_cache_binding_is_visible_to_runtime_layer_instance():
+    registered_layer = _FakeAttentionLayer()
+    runtime_layer = _FakeAttentionLayer()
+    registered_layer.prefix = runtime_layer.prefix = "model.layers.1.linear_attn"
+    latency = (torch.tensor([1]), torch.tensor([2]))
+    throughput = (torch.tensor([3]), torch.tensor([4]))
+
+    with override_dual_stream_role(dual_stream.LATENCY):
+        registered_layer.bind_kv_cache(latency)
+    with override_dual_stream_role(dual_stream.THROUGHPUT):
+        registered_layer.bind_kv_cache(throughput)
+
+    with override_dual_stream_role(dual_stream.LATENCY):
+        resolved = runtime_layer.kv_cache
+        assert all(actual is expected for actual, expected in zip(resolved, latency))
+    with override_dual_stream_role(dual_stream.THROUGHPUT):
+        resolved = runtime_layer.kv_cache
+        assert all(actual is expected for actual, expected in zip(resolved, throughput))
+
+
 def test_role_context_binds_model_state_role():
     assert get_dual_stream_role() is None
     with dual_stream.role_context(dual_stream.LATENCY):
@@ -156,6 +176,19 @@ def test_aux_stream_is_disabled_in_dual_mode(monkeypatch):
     monkeypatch.setattr(torch_utils, "_aux_stream", sentinel)
 
     assert torch_utils.aux_stream() is None
+
+
+def test_flashinfer_fused_allreduce_is_disabled_in_dual_mode(monkeypatch):
+    from vllm.model_executor.layers import fused_allreduce_gemma_rms_norm
+
+    monkeypatch.setenv("VLLM_DUAL_STREAM", "1")
+
+    # The dual-mode guard must run before inspecting the tensor or initializing
+    # FlashInfer's process-global workspace.
+    assert fused_allreduce_gemma_rms_norm._can_use_flashinfer(object(), 8) == (
+        False,
+        0,
+    )
 
 
 def test_shared_expert_transient_output_is_thread_local():

@@ -1,3 +1,31 @@
+diff --git a/distributed/device_communicators/cuda_communicator.py b/distributed/device_communicators/cuda_communicator.py
+index 91739a4..be18bc6 100644
+--- a/distributed/device_communicators/cuda_communicator.py
++++ b/distributed/device_communicators/cuda_communicator.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
+ from torch.distributed import ProcessGroup
+ 
+@@ -56,7 +58,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
+ 
+             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
+-            use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
++            # FlashInfer all-reduce owns a process-global workspace and is not
++            # safe to launch from the two concurrent role streams. Dual-stream
++            # mode routes collectives through its role-aware TP groups instead.
++            use_flashinfer_allreduce = (
++                envs.VLLM_ALLREDUCE_USE_FLASHINFER
++                and os.environ.get("VLLM_DUAL_STREAM", "0") != "1"
++            )
+             use_aiter_allreduce = use_custom_allreduce and bool(
+                 rocm_aiter_ops.is_custom_all_reduce_enabled()
+             )
 diff --git a/distributed/parallel_state.py b/distributed/parallel_state.py
 index b3545d5..88ab349 100644
 --- a/distributed/parallel_state.py
@@ -125,21 +153,57 @@ index f57fc2c..a991d39 100644
  
  @contextmanager
 diff --git a/model_executor/layers/attention_layer_base.py b/model_executor/layers/attention_layer_base.py
-index 197213d..45f1d86 100644
+index 197213d..a263ece 100644
 --- a/model_executor/layers/attention_layer_base.py
 +++ b/model_executor/layers/attention_layer_base.py
-@@ -3,6 +3,7 @@
+@@ -3,6 +3,8 @@
  """Base class for attention-like layers."""
  
  from abc import ABC, abstractmethod
-+from typing import Any
++from typing import Any, ClassVar
++from weakref import ReferenceType, ref
  
  import torch
  
-@@ -23,6 +24,38 @@ class AttentionLayerBase(ABC):
+@@ -22,6 +24,89 @@ class AttentionLayerBase(ABC):
+ 
      impl: "AttentionImpl"
      supports_dcp: bool = True
- 
++    _dual_stream_kv_registry: ClassVar[
++        dict[
++            tuple[str, str],
++            tuple[bool, ReferenceType[Any] | tuple[ReferenceType[Any], ...]],
++        ]
++    ] = {}
++
++    def _dual_stream_kv_cache_key(self) -> str | None:
++        """Return the stable name used by the model's forward context."""
++        return getattr(self, "layer_name", None) or getattr(self, "prefix", None)
++
++    @staticmethod
++    def _make_dual_stream_kv_ref(
++        value: Any,
++    ) -> tuple[bool, ReferenceType[Any] | tuple[ReferenceType[Any], ...]] | None:
++        if isinstance(value, torch.Tensor):
++            return False, ref(value)
++        if isinstance(value, tuple) and all(isinstance(v, torch.Tensor) for v in value):
++            return True, tuple(ref(v) for v in value)
++        return None
++
++    @staticmethod
++    def _resolve_dual_stream_kv_ref(
++        cache_ref: tuple[bool, ReferenceType[Any] | tuple[ReferenceType[Any], ...]],
++    ) -> Any | None:
++        is_tuple, refs = cache_ref
++        if not is_tuple:
++            assert isinstance(refs, ReferenceType)
++            return refs()
++        assert isinstance(refs, tuple)
++        values = tuple(cache_ref() for cache_ref in refs)
++        if any(value is None for value in values):
++            return None
++        return values
++
 +    @property
 +    def kv_cache(self) -> Any:
 +        """Return the cache bound to the current dual-stream role.
@@ -154,6 +218,19 @@ index 197213d..45f1d86 100644
 +        role_caches = getattr(self, "_dual_stream_kv_caches", None)
 +        if role is not None and role_caches is not None and role in role_caches:
 +            return role_caches[role]
++        # Some pluggable hybrid layers execute through a runtime module instance
++        # distinct from the object registered in static_forward_context. Resolve
++        # those through the stable layer name without retaining cache tensors
++        # after their owning model is released.
++        layer_key = self._dual_stream_kv_cache_key()
++        if role is not None and layer_key is not None:
++            registry_key = (layer_key, role)
++            cache_ref = AttentionLayerBase._dual_stream_kv_registry.get(registry_key)
++            if cache_ref is not None:
++                value = self._resolve_dual_stream_kv_ref(cache_ref)
++                if value is not None:
++                    return value
++                AttentionLayerBase._dual_stream_kv_registry.pop(registry_key, None)
 +        if hasattr(self, "_kv_cache"):
 +            return self._kv_cache
 +        raise AttributeError("KV cache has not been bound")
@@ -171,10 +248,39 @@ index 197213d..45f1d86 100644
 +            role_caches = {}
 +            self._dual_stream_kv_caches = role_caches
 +        role_caches[role] = value
-+
++        layer_key = self._dual_stream_kv_cache_key()
++        cache_ref = self._make_dual_stream_kv_ref(value)
++        if layer_key is not None and cache_ref is not None:
++            AttentionLayerBase._dual_stream_kv_registry[(layer_key, role)] = cache_ref
+ 
      def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
          """Bind the allocated KV cache tensor to this layer.
+diff --git a/model_executor/layers/fused_allreduce_gemma_rms_norm.py b/model_executor/layers/fused_allreduce_gemma_rms_norm.py
+index e49e135..c971716 100644
+--- a/model_executor/layers/fused_allreduce_gemma_rms_norm.py
++++ b/model_executor/layers/fused_allreduce_gemma_rms_norm.py
+@@ -14,6 +14,8 @@ oversize batch) it falls back to ``all_reduce`` + ``GemmaRMSNorm``, which is
+ numerically identical to the unfused model path.
+ """
  
++import os
++
+ import torch
+ 
+ from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
+@@ -66,6 +68,12 @@ def _max_token_num(tp_size: int, hidden_size: int, dtype: torch.dtype) -> int |
+ 
+ def _can_use_flashinfer(hidden_states: torch.Tensor, tp_size: int) -> tuple[bool, int]:
+     """Whether the flashinfer fused path applies; returns (ok, max_token_num)."""
++    # FlashInfer's fused collective uses a process-global MNNVL workspace. It
++    # bypasses the dual-stream role-aware TP group and collective sequencer, so
++    # concurrent role launches can deadlock even though ordinary all-reduces
++    # are ordered. Fall back to the sequenced tensor-parallel all-reduce.
++    if os.environ.get("VLLM_DUAL_STREAM", "0") == "1":
++        return False, 0
+     if (
+         flashinfer_trtllm_fused_allreduce_norm is None
+         or get_fi_ar_workspace is None
 diff --git a/model_executor/layers/fused_moe/runner/shared_experts.py b/model_executor/layers/fused_moe/runner/shared_experts.py
 index dc4c99e..456870d 100644
 --- a/model_executor/layers/fused_moe/runner/shared_experts.py
@@ -309,7 +415,7 @@ index 5a02974..da94948 100644
  
  @triton.jit
 diff --git a/v1/engine/core.py b/v1/engine/core.py
-index 476f53d..7a2861a 100644
+index 476f53d..e75b1a9 100644
 --- a/v1/engine/core.py
 +++ b/v1/engine/core.py
 @@ -112,6 +112,10 @@ class EngineCore:
@@ -422,7 +528,7 @@ index 476f53d..7a2861a 100644
      def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
          """Schedule, execute, and make output.
  
-@@ -582,8 +643,63 @@ class EngineCore:
+@@ -582,10 +643,68 @@ class EngineCore:
  
          # Check for any requests remaining in the scheduler - unfinished,
          # or finished and not yet removed from the batch.
@@ -486,9 +592,26 @@ index 476f53d..7a2861a 100644
 +        if not thr_has_requests:
 +            return lat_outputs, lat_model_executed
          scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
++        throughput_role = "throughput" if sched_lat is not None else None
++        future = self.model_executor.execute_model(
++            scheduler_output, non_block=True, role=throughput_role
++        )
          grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-@@ -603,6 +719,12 @@ class EngineCore:
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
+@@ -593,7 +712,9 @@ class EngineCore:
+         ):
+             model_output = future.result()
+             if model_output is None:
+-                model_output = self.model_executor.sample_tokens(grammar_output)
++                model_output = self.model_executor.sample_tokens(
++                    grammar_output, role=throughput_role
++                )
+ 
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+@@ -603,6 +724,12 @@ class EngineCore:
          )
          self._attach_iteration_details(engine_core_outputs, iteration_details)
  
@@ -501,7 +624,7 @@ index 476f53d..7a2861a 100644
          return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
  
      def post_step(self, model_executed: bool) -> None:
-@@ -747,6 +869,8 @@ class EngineCore:
+@@ -747,6 +874,8 @@ class EngineCore:
              self.model_executor.shutdown()
          if self.scheduler:
              self.scheduler.shutdown()
@@ -510,7 +633,7 @@ index 476f53d..7a2861a 100644
  
          # Undo the gc.freeze() from __init__ so that the objects allocated
          # during engine startup (model weights, KV caches, etc.) become
-@@ -764,7 +888,7 @@ class EngineCore:
+@@ -764,7 +893,7 @@ class EngineCore:
      def reset_mm_cache(self):
          # NOTE: Since this is mainly for debugging, we don't attempt to
          # re-sync the internal caches (P0 sender, P1 receiver)
@@ -519,7 +642,7 @@ index 476f53d..7a2861a 100644
              logger.warning(
                  "Resetting the multi-modal cache when requests are "
                  "in progress may lead to desynced internal caches."
-@@ -779,9 +903,14 @@ class EngineCore:
+@@ -779,9 +908,14 @@ class EngineCore:
      def reset_prefix_cache(
          self, reset_running_requests: bool = False, reset_connector: bool = False
      ) -> bool:
@@ -537,7 +660,7 @@ index 476f53d..7a2861a 100644
  
      def reset_encoder_cache(self) -> None:
          """Reset the encoder cache to invalidate all cached encoder outputs.
-@@ -792,14 +921,15 @@ class EngineCore:
+@@ -792,14 +926,15 @@ class EngineCore:
          """
          # NOTE: Since this is mainly for debugging, we don't attempt to
          # re-sync the internal caches (P0 sender, P1 receiver)
@@ -555,7 +678,7 @@ index 476f53d..7a2861a 100644
          # Reset the GPU model runner's encoder cache (physical storage)
          self.model_executor.reset_encoder_cache()
  
-@@ -840,10 +970,12 @@ class EngineCore:
+@@ -840,10 +975,12 @@ class EngineCore:
              raise ValueError("'wait' mode can't be used in inproc-engine mode")
  
          if mode == "abort":
@@ -570,7 +693,7 @@ index 476f53d..7a2861a 100644
          if clear_cache:
              self._reset_caches()
  
-@@ -851,11 +983,15 @@ class EngineCore:
+@@ -851,11 +988,15 @@ class EngineCore:
  
      def resume_scheduler(self) -> None:
          """Resume the scheduler and flush any requests queued while paused."""
@@ -588,7 +711,7 @@ index 476f53d..7a2861a 100644
  
      def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
          """Put the engine to sleep at the specified level.
-@@ -1347,7 +1483,7 @@ class EngineCoreProc(EngineCore):
+@@ -1347,7 +1488,7 @@ class EngineCoreProc(EngineCore):
          """Returns true if the engine should be stepped."""
          return (
              self.engines_running
@@ -597,7 +720,7 @@ index 476f53d..7a2861a 100644
              or bool(self.batch_queue)
          )
  
-@@ -1410,7 +1546,7 @@ class EngineCoreProc(EngineCore):
+@@ -1410,7 +1551,7 @@ class EngineCoreProc(EngineCore):
          # If no model execution happened but there is still scheduler work
          # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
          # the GIL briefly to allow background transfer threads to make progress.
@@ -606,7 +729,7 @@ index 476f53d..7a2861a 100644
              time.sleep(0.001)
  
          return model_executed
-@@ -1436,18 +1572,29 @@ class EngineCoreProc(EngineCore):
+@@ -1436,18 +1577,29 @@ class EngineCoreProc(EngineCore):
              )
  
              if shutdown_timeout == 0:
@@ -641,7 +764,7 @@ index 476f53d..7a2861a 100644
                  if num_requests > 0:
                      logger.info(
                          "[shutdown] EngineCore: draining in-flight requests "
-@@ -1786,13 +1933,19 @@ class EngineCoreProc(EngineCore):
+@@ -1786,13 +1938,19 @@ class EngineCoreProc(EngineCore):
              future.set_result(None)
  
          if mode == "abort":
