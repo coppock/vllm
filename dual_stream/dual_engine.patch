@@ -11,21 +11,21 @@ index b3545d5..88ab349 100644
  from datetime import timedelta
  from multiprocessing import shared_memory
 @@ -1360,13 +1361,27 @@ def _replace_active_groups(
-
-
+ 
+ 
  _TP: GroupCoordinator | None = None
 +_TP_OVERRIDE: ContextVar[GroupCoordinator | None] = ContextVar(
 +    "vllm_tp_group_override", default=None
 +)
-
-
+ 
+ 
  def get_tp_group() -> GroupCoordinator:
 +    if (group := _TP_OVERRIDE.get()) is not None:
 +        return group
      assert _TP is not None, "tensor model parallel group is not initialized"
      return _TP
-
-
+ 
+ 
 +@contextmanager
 +def override_tp_group(group: GroupCoordinator):
 +    token = _TP_OVERRIDE.set(group)
@@ -36,10 +36,10 @@ index b3545d5..88ab349 100644
 +
 +
  _DCP: GroupCoordinator | None = None
-
-
+ 
+ 
 diff --git a/forward_context.py b/forward_context.py
-index f57fc2c..fa41e23 100644
+index f57fc2c..a991d39 100644
 --- a/forward_context.py
 +++ b/forward_context.py
 @@ -4,6 +4,7 @@
@@ -49,17 +49,20 @@ index f57fc2c..fa41e23 100644
 +from contextvars import ContextVar
  from dataclasses import dataclass, field
  from typing import Any
-
-@@ -193,20 +194,35 @@ class ForwardContext:
+ 
+@@ -193,20 +194,53 @@ class ForwardContext:
          )
-
-
+ 
+ 
 -_forward_context: ForwardContext | None = None
 +_forward_context: ContextVar[ForwardContext | None] = ContextVar(
 +    "vllm_forward_context", default=None
 +)
-
-
++_dual_stream_role: ContextVar[str | None] = ContextVar(
++    "vllm_dual_stream_role", default=None
++)
+ 
+ 
  def get_forward_context() -> ForwardContext:
      """Get the current forward context."""
 -    assert _forward_context is not None, (
@@ -70,11 +73,26 @@ index f57fc2c..fa41e23 100644
      )
 -    return _forward_context
 +    return forward_context
-
-
+ 
+ 
  def is_forward_context_available() -> bool:
 -    return _forward_context is not None
 +    return _forward_context.get() is not None
++
++
++def get_dual_stream_role() -> str | None:
++    """Return the execution role bound to this context, when dual-stream is active."""
++    return _dual_stream_role.get()
++
++
++@contextmanager
++def override_dual_stream_role(role: str | None):
++    """Bind a dual-stream role for model state that must be role-specific."""
++    token = _dual_stream_role.set(role)
++    try:
++        yield
++    finally:
++        _dual_stream_role.reset(token)
 +
 +
 +def set_forward_context_for_current_thread(
@@ -87,10 +105,10 @@ index f57fc2c..fa41e23 100644
 +    persistent thread-local assignment instead of a lexical context manager.
 +    """
 +    _forward_context.set(forward_context)
-
-
+ 
+ 
  def create_forward_context(
-@@ -247,13 +263,11 @@ def override_forward_context(forward_context: ForwardContext | None):
+@@ -247,13 +281,11 @@ def override_forward_context(forward_context: ForwardContext | None):
      This is used to override the forward context for a specific
      forward pass.
      """
@@ -103,17 +121,162 @@ index f57fc2c..fa41e23 100644
      finally:
 -        _forward_context = prev_context
 +        _forward_context.reset(token)
-
-
+ 
+ 
  @contextmanager
+diff --git a/model_executor/layers/attention_layer_base.py b/model_executor/layers/attention_layer_base.py
+index 197213d..45f1d86 100644
+--- a/model_executor/layers/attention_layer_base.py
++++ b/model_executor/layers/attention_layer_base.py
+@@ -3,6 +3,7 @@
+ """Base class for attention-like layers."""
+ 
+ from abc import ABC, abstractmethod
++from typing import Any
+ 
+ import torch
+ 
+@@ -23,6 +24,38 @@ class AttentionLayerBase(ABC):
+     impl: "AttentionImpl"
+     supports_dcp: bool = True
+ 
++    @property
++    def kv_cache(self) -> Any:
++        """Return the cache bound to the current dual-stream role.
++
++        Dual runners share the model module and therefore its attention-layer
++        objects, but their cache allocations must remain disjoint. Outside
++        dual-stream execution this behaves like the original plain attribute.
++        """
++        from vllm.forward_context import get_dual_stream_role
++
++        role = get_dual_stream_role()
++        role_caches = getattr(self, "_dual_stream_kv_caches", None)
++        if role is not None and role_caches is not None and role in role_caches:
++            return role_caches[role]
++        if hasattr(self, "_kv_cache"):
++            return self._kv_cache
++        raise AttributeError("KV cache has not been bound")
++
++    @kv_cache.setter
++    def kv_cache(self, value: Any) -> None:
++        from vllm.forward_context import get_dual_stream_role
++
++        role = get_dual_stream_role()
++        if role is None:
++            self._kv_cache = value
++            return
++        role_caches = getattr(self, "_dual_stream_kv_caches", None)
++        if role_caches is None:
++            role_caches = {}
++            self._dual_stream_kv_caches = role_caches
++        role_caches[role] = value
++
+     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+         """Bind the allocated KV cache tensor to this layer.
+ 
+diff --git a/model_executor/layers/fused_moe/runner/shared_experts.py b/model_executor/layers/fused_moe/runner/shared_experts.py
+index dc4c99e..456870d 100644
+--- a/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import threading
+ from collections.abc import Callable
+ from enum import IntEnum
+ 
+@@ -51,7 +52,10 @@ class SharedExperts(torch.nn.Module):
+         # DBO ubatch id to handle this case.  If DBO is not enabled, the
+         # index is always 0 and the second output list element is ignored.
+         self.enable_dbo = enable_dbo
+-        self._output: list[torch.Tensor | None] = [None, None]
++        # The model module can be shared by two dual-stream host threads.
++        # Keep transient outputs per host thread even when stream overlap is
++        # disabled, otherwise one forward can consume the other's tensor.
++        self._output_local = threading.local()
+         self._layer = layer
+         self._moe_config = moe_config
+ 
+@@ -145,6 +149,14 @@ class SharedExperts(torch.nn.Module):
+     def _output_idx(self) -> int:
+         return dbo_current_ubatch_id() if self.enable_dbo else 0
+ 
++    @property
++    def _output(self) -> list[torch.Tensor | None]:
++        output = getattr(self._output_local, "value", None)
++        if output is None:
++            output = [None, None]
++            self._output_local.value = output
++        return output
++
+     @property
+     def output(self) -> torch.Tensor:
+         assert self._output[self._output_idx] is not None
+diff --git a/models/kimi_k3/nvidia/model.py b/models/kimi_k3/nvidia/model.py
+index 951481d..71f0556 100644
+--- a/models/kimi_k3/nvidia/model.py
++++ b/models/kimi_k3/nvidia/model.py
+@@ -3,6 +3,7 @@
+ """Kimi-K3 multimodal model implementation for vLLM."""
+ 
+ import math
++import os
+ from collections.abc import Iterable
+ from typing import Any, cast
+ 
+@@ -563,7 +564,10 @@ class KimiMoE(nn.Module):
+                 activation_linear_beta=activation_situ_linear_beta,
+             )
+         else:
+-            enable_tail_fusion = envs.VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION
++            enable_tail_fusion = (
++                envs.VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION
++                and os.environ.get("VLLM_DUAL_STREAM", "0") != "1"
++            )
+             self.experts = FusedMoE(
+                 shared_experts=self.shared_experts,
+                 num_experts=num_experts,
+@@ -1015,7 +1019,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
+         # Aux stream for overlapping the MLA g_proj output-gate GEMM with the
+         # attention front-end (DeepseekV4 convention: created at the model
+         # level and threaded into each attention layer).
+-        aux_stream = torch.cuda.Stream()
++        # These events and this stream are shared by every layer in the model.
++        # Dual runners share the model too, so concurrent use would race.
++        aux_stream = (
++            None
++            if os.environ.get("VLLM_DUAL_STREAM", "0") == "1"
++            else torch.cuda.Stream()
++        )
+ 
+         def get_layer(prefix: str):
+             return KimiDecoderLayer(
+diff --git a/utils/torch_utils.py b/utils/torch_utils.py
+index 1472024..87efb3c 100644
+--- a/utils/torch_utils.py
++++ b/utils/torch_utils.py
+@@ -714,6 +714,12 @@ def aux_stream() -> torch.cuda.Stream | None:
+     """
+     global _aux_stream
+ 
++    # A model's process-global auxiliary stream and events are not safe when
++    # two host threads execute the shared module concurrently. Dual-stream
++    # already supplies one CUDA stream per role, so keep model internals on it.
++    if os.environ.get("VLLM_DUAL_STREAM", "0") == "1":
++        return None
++
+     from vllm.platforms import current_platform
+ 
+     if _aux_stream is None and current_platform.is_cuda_alike():
 diff --git a/v1/attention/backends/flashinfer.py b/v1/attention/backends/flashinfer.py
 index 5a02974..da94948 100644
 --- a/v1/attention/backends/flashinfer.py
 +++ b/v1/attention/backends/flashinfer.py
 @@ -89,16 +89,29 @@ FP4_DTYPE = torch.uint8
-
+ 
  logger = init_logger(__name__)
-
+ 
 -trtllm_workspace_buffer = None
 +trtllm_workspace_buffers: dict[str | None, torch.Tensor] = {}
 +
@@ -127,8 +290,8 @@ index 5a02974..da94948 100644
 +    except ImportError:
 +        pass
 +    return None
-
-
+ 
+ 
  def _get_trtllm_workspace_buffer():
 -    global trtllm_workspace_buffer
 -    if trtllm_workspace_buffer is None:
@@ -142,8 +305,8 @@ index 5a02974..da94948 100644
 -    return trtllm_workspace_buffer
 +        trtllm_workspace_buffers[role] = workspace_buffer
 +    return workspace_buffer
-
-
+ 
+ 
  @triton.jit
 diff --git a/v1/engine/core.py b/v1/engine/core.py
 index 476f53d..7a2861a 100644
@@ -151,7 +314,7 @@ index 476f53d..7a2861a 100644
 +++ b/v1/engine/core.py
 @@ -112,6 +112,10 @@ class EngineCore:
          load_general_plugins()
-
+ 
          self.vllm_config = vllm_config
 +        from vllm.v1.worker import dual_stream as _ds
 +
@@ -163,7 +326,7 @@ index 476f53d..7a2861a 100644
 @@ -150,15 +154,42 @@ class EngineCore:
              kv_cache_config, vllm_config
          )
-
+ 
 +        # Dual-stream: the workers carve their KV pool into throughput and
 +        # latency partitions, so the schedulers must use the matching block
 +        # counts. Otherwise they could assign block ids that the runner has no
@@ -207,7 +370,7 @@ index 476f53d..7a2861a 100644
 @@ -468,7 +499,19 @@ class EngineCore:
                  "Disabling ECTransfer for this request."
              )
-
+ 
 -        self.scheduler.add_request(request)
 +        scheduler_lat = self.scheduler_lat
 +        _lat_ok = (
@@ -238,13 +401,13 @@ index 476f53d..7a2861a 100644
 +        if scheduler_lat is None:
 +            return (self.scheduler,)
 +        return self.scheduler, scheduler_lat
-
+ 
      @contextmanager
      def log_error_detail(self, scheduler_output: SchedulerOutput):
 @@ -573,6 +623,17 @@ class EngineCore:
          Overridden by the DP engine core; never throttles otherwise."""
          return False
-
+ 
 +    def _any_scheduler_has_requests(self) -> bool:
 +        """Work exists if EITHER engine has it.
 +
@@ -258,9 +421,9 @@ index 476f53d..7a2861a 100644
 +
      def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
          """Schedule, execute, and make output.
-
+ 
 @@ -582,8 +643,63 @@ class EngineCore:
-
+ 
          # Check for any requests remaining in the scheduler - unfinished,
          # or finished and not yet removed from the batch.
 -        if not self.scheduler.has_requests():
@@ -328,7 +491,7 @@ index 476f53d..7a2861a 100644
 @@ -603,6 +719,12 @@ class EngineCore:
          )
          self._attach_iteration_details(engine_core_outputs, iteration_details)
-
+ 
 +        for _cid, _out in lat_outputs.items():
 +            if _cid in engine_core_outputs:
 +                engine_core_outputs[_cid].outputs.extend(_out.outputs)
@@ -336,7 +499,7 @@ index 476f53d..7a2861a 100644
 +                engine_core_outputs[_cid] = _out
 +
          return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
-
+ 
      def post_step(self, model_executed: bool) -> None:
 @@ -747,6 +869,8 @@ class EngineCore:
              self.model_executor.shutdown()
@@ -344,7 +507,7 @@ index 476f53d..7a2861a 100644
              self.scheduler.shutdown()
 +        if self.scheduler_lat:
 +            self.scheduler_lat.shutdown()
-
+ 
          # Undo the gc.freeze() from __init__ so that the objects allocated
          # during engine startup (model weights, KV caches, etc.) become
 @@ -764,7 +888,7 @@ class EngineCore:
@@ -371,7 +534,7 @@ index 476f53d..7a2861a 100644
 +            for scheduler in self._all_schedulers()
 +        ]
 +        return all(results)
-
+ 
      def reset_encoder_cache(self) -> None:
          """Reset the encoder cache to invalidate all cached encoder outputs.
 @@ -792,14 +921,15 @@ class EngineCore:
@@ -384,37 +547,37 @@ index 476f53d..7a2861a 100644
                  "Resetting the encoder cache when requests are "
                  "in progress may lead to desynced internal caches."
              )
-
+ 
          # Reset the scheduler's encoder cache manager (logical state)
 -        self.scheduler.reset_encoder_cache()
 +        for scheduler in self._all_schedulers():
 +            scheduler.reset_encoder_cache()
          # Reset the GPU model runner's encoder cache (physical storage)
          self.model_executor.reset_encoder_cache()
-
+ 
 @@ -840,10 +970,12 @@ class EngineCore:
              raise ValueError("'wait' mode can't be used in inproc-engine mode")
-
+ 
          if mode == "abort":
 -            self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
 +            for scheduler in self._all_schedulers():
 +                scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
-
+ 
          pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
 -        self.scheduler.set_pause_state(pause_state)
 +        for scheduler in self._all_schedulers():
 +            scheduler.set_pause_state(pause_state)
          if clear_cache:
              self._reset_caches()
-
+ 
 @@ -851,11 +983,15 @@ class EngineCore:
-
+ 
      def resume_scheduler(self) -> None:
          """Resume the scheduler and flush any requests queued while paused."""
 -        self.scheduler.set_pause_state(PauseState.UNPAUSED)
 +        for scheduler in self._all_schedulers():
 +            scheduler.set_pause_state(PauseState.UNPAUSED)
-
+ 
      def is_scheduler_paused(self) -> bool:
          """Return whether the scheduler is in any pause state."""
 -        return self.scheduler.pause_state != PauseState.UNPAUSED
@@ -422,7 +585,7 @@ index 476f53d..7a2861a 100644
 +            scheduler.pause_state != PauseState.UNPAUSED
 +            for scheduler in self._all_schedulers()
 +        )
-
+ 
      def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
          """Put the engine to sleep at the specified level.
 @@ -1347,7 +1483,7 @@ class EngineCoreProc(EngineCore):
@@ -433,7 +596,7 @@ index 476f53d..7a2861a 100644
 +            or self._any_scheduler_has_requests()
              or bool(self.batch_queue)
          )
-
+ 
 @@ -1410,7 +1546,7 @@ class EngineCoreProc(EngineCore):
          # If no model execution happened but there is still scheduler work
          # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
@@ -441,11 +604,11 @@ index 476f53d..7a2861a 100644
 -        if not model_executed and self.scheduler.has_requests():
 +        if not model_executed and self._any_scheduler_has_requests():
              time.sleep(0.001)
-
+ 
          return model_executed
 @@ -1436,18 +1572,29 @@ class EngineCoreProc(EngineCore):
              )
-
+ 
              if shutdown_timeout == 0:
 -                num_requests = self.scheduler.get_num_unfinished_requests()
 +                num_requests = sum(
@@ -480,7 +643,7 @@ index 476f53d..7a2861a 100644
                          "[shutdown] EngineCore: draining in-flight requests "
 @@ -1786,13 +1933,19 @@ class EngineCoreProc(EngineCore):
              future.set_result(None)
-
+ 
          if mode == "abort":
 -            aborted_reqs = self.scheduler.finish_requests(
 -                None, RequestStatus.FINISHED_ABORTED
@@ -494,12 +657,12 @@ index 476f53d..7a2861a 100644
 +                    )
 +                )
              self._send_abort_outputs(aborted_reqs)
-
+ 
          pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
 -        self.scheduler.set_pause_state(pause_state)
 +        for scheduler in self._all_schedulers():
 +            scheduler.set_pause_state(pause_state)
-
+ 
          if self._pause_complete():
              if clear_cache:
 diff --git a/v1/executor/abstract.py b/v1/executor/abstract.py
@@ -507,7 +670,7 @@ index 4063844..4c7ff73 100644
 --- a/v1/executor/abstract.py
 +++ b/v1/executor/abstract.py
 @@ -208,41 +208,81 @@ class Executor(ABC):
-
+ 
      @overload
      def execute_model(
 -        self, scheduler_output: SchedulerOutput, non_block: Literal[False] = False
@@ -517,7 +680,7 @@ index 4063844..4c7ff73 100644
 +        role: str | None = None,
      ) -> ModelRunnerOutput | None:
          pass
-
+ 
      @overload
      def execute_model(
 -        self, scheduler_output: SchedulerOutput, non_block: Literal[True] = True
@@ -527,7 +690,7 @@ index 4063844..4c7ff73 100644
 +        role: str | None = None,
      ) -> Future[ModelRunnerOutput | None]:
          pass
-
+ 
      def execute_model(
 -        self, scheduler_output: SchedulerOutput, non_block: bool = False
 +        self,
@@ -560,7 +723,7 @@ index 4063844..4c7ff73 100644
 +            ),
          )
          return output[0]
-
+ 
      @overload
      def sample_tokens(
 -        self, grammar_output: GrammarOutput | None, non_block: Literal[False] = False
@@ -570,7 +733,7 @@ index 4063844..4c7ff73 100644
 +        role: str | None = None,
      ) -> ModelRunnerOutput:
          pass
-
+ 
      @overload
      def sample_tokens(
 -        self, grammar_output: GrammarOutput | None, non_block: Literal[True] = True
@@ -580,7 +743,7 @@ index 4063844..4c7ff73 100644
 +        role: str | None = None,
      ) -> Future[ModelRunnerOutput]:
          pass
-
+ 
      def sample_tokens(
 -        self, grammar_output: GrammarOutput | None, non_block: bool = False
 +        self,
@@ -595,14 +758,14 @@ index 4063844..4c7ff73 100644
 +            non_block=non_block,
          )
          return output[0]
-
+ 
 diff --git a/v1/executor/multiproc_executor.py b/v1/executor/multiproc_executor.py
 index 0a3a6d1..f73a2d1 100644
 --- a/v1/executor/multiproc_executor.py
 +++ b/v1/executor/multiproc_executor.py
 @@ -319,23 +319,48 @@ class MultiprocExecutor(Executor):
              self.failure_callback = callback
-
+ 
      def execute_model(  # type: ignore[override]
 -        self, scheduler_output: SchedulerOutput, non_block: bool = False
 +        self,
@@ -619,7 +782,7 @@ index 0a3a6d1..f73a2d1 100644
              timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
              kv_output_aggregator=self.kv_output_aggregator,
          )
-
+ 
 +    def execute_model_dual(
 +        self,
 +        lat_scheduler_output: SchedulerOutput,
@@ -659,7 +822,7 @@ index 3bac65b..b50b0ea 100644
 +++ b/v1/executor/uniproc_executor.py
 @@ -106,11 +106,14 @@ class UniProcExecutor(Executor):
          return future
-
+ 
      def execute_model(  # type: ignore[override]
 -        self, scheduler_output: SchedulerOutput, non_block: bool = False
 +        self,
@@ -677,7 +840,7 @@ index 3bac65b..b50b0ea 100644
 @@ -120,12 +123,33 @@ class UniProcExecutor(Executor):
              output.result()
          return output
-
+ 
 +    def execute_model_dual(
 +        self,
 +        lat_scheduler_output: SchedulerOutput,
@@ -712,10 +875,10 @@ index 3bac65b..b50b0ea 100644
          )
 diff --git a/v1/worker/dual_stream.py b/v1/worker/dual_stream.py
 new file mode 100644
-index 0000000..cd090b2
+index 0000000..a3b0c1a
 --- /dev/null
 +++ b/v1/worker/dual_stream.py
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,388 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -1070,18 +1233,16 @@ index 0000000..cd090b2
 +    if not enabled() or role not in _streams:
 +        yield None
 +        return
-+    prev = getattr(_thread_state, "role", None)
 +    prev_index = getattr(_thread_state, "collective_index", None)
-+    _thread_state.role = role
 +    _thread_state.collective_index = 0
 +    try:
 +        with (
++            role_context(role),
 +            ps.override_tp_group(_tp_groups[role]),
 +            torch.cuda.stream(_streams[role]),
 +        ):
 +            yield _streams[role]
 +    finally:
-+        _thread_state.role = prev
 +        _thread_state.collective_index = prev_index
 +
 +
@@ -1092,8 +1253,22 @@ index 0000000..cd090b2
 +def current_role() -> str | None:
 +    """Return the dual-stream role bound to the current host thread."""
 +    return getattr(_thread_state, "role", None)
++
++
++@contextlib.contextmanager
++def role_context(role: str):
++    """Bind role-specific model state without changing the active CUDA stream."""
++    from vllm.forward_context import override_dual_stream_role
++
++    prev = getattr(_thread_state, "role", None)
++    _thread_state.role = role
++    try:
++        with override_dual_stream_role(role):
++            yield
++    finally:
++        _thread_state.role = prev
 diff --git a/v1/worker/gpu_worker.py b/v1/worker/gpu_worker.py
-index ca63e0a..e8aef06 100644
+index ca63e0a..941520a 100644
 --- a/v1/worker/gpu_worker.py
 +++ b/v1/worker/gpu_worker.py
 @@ -9,7 +9,7 @@ from collections.abc import Callable
@@ -1102,13 +1277,13 @@ index ca63e0a..e8aef06 100644
  from types import NoneType
 -from typing import TYPE_CHECKING, Any
 +from typing import TYPE_CHECKING, Any, cast
-
+ 
  import numpy as np
  import regex as re
 @@ -425,6 +425,30 @@ class Worker(WorkerBase):
          ):
              self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
-
+ 
 +        # Build the latency runner after weights exist, pointing it at the same
 +        # nn.Module. Mutable runner state must be distinct; weights must not be.
 +        from vllm.v1.worker import dual_stream as _ds
@@ -1136,10 +1311,10 @@ index ca63e0a..e8aef06 100644
          if self.vllm_config.weight_transfer_config is not None:
              self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                  self.vllm_config.weight_transfer_config,
-@@ -645,8 +669,20 @@ class Worker(WorkerBase):
+@@ -645,8 +669,22 @@ class Worker(WorkerBase):
          # related to kv cache connector (e.g. kv cache sharing layers).
          ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
-
+ 
 -        with self._maybe_get_memory_pool_context(tag="kv_cache"):
 -            self.model_runner.initialize_kv_cache(kv_cache_config)
 +        from vllm.v1.worker import dual_stream as _ds
@@ -1151,63 +1326,73 @@ index ca63e0a..e8aef06 100644
 +                kv_cache_config, _ds.latency_kv_fraction()
 +            )
 +            with self._maybe_get_memory_pool_context(tag="kv_cache"):
-+                self.model_runner.initialize_kv_cache(thr_cfg)
-+                latency_runner.initialize_kv_cache(lat_cfg)
++                with _ds.role_context(_ds.THROUGHPUT):
++                    self.model_runner.initialize_kv_cache(thr_cfg)
++                with _ds.role_context(_ds.LATENCY):
++                    latency_runner.initialize_kv_cache(lat_cfg)
 +        else:
 +            with self._maybe_get_memory_pool_context(tag="kv_cache"):
 +                self.model_runner.initialize_kv_cache(kv_cache_config)
-
+ 
          if self.model_config.enable_return_routed_experts:
              self.model_runner.init_routed_experts_capturer()
-@@ -658,9 +694,30 @@ class Worker(WorkerBase):
+@@ -657,10 +695,37 @@ class Worker(WorkerBase):
+         if kv_cache_config.needs_kv_cache_zeroing and hasattr(
              self.model_runner, "_init_kv_zero_meta"
          ):
-             self.model_runner._init_kv_zero_meta()
+-            self.model_runner._init_kv_zero_meta()
++            with _ds.role_context(_ds.THROUGHPUT):
++                self.model_runner._init_kv_zero_meta()
 +            # The latency runner has its own KV tensors, so it needs its own zeroing
 +            # metadata; without it update_requests asserts on a null kv_block_zeroer.
 +            ds_runner = getattr(self, "dual_stream_runner", None)
 +            if ds_runner is not None and hasattr(ds_runner, "_init_kv_zero_meta"):
-+                ds_runner._init_kv_zero_meta()
-
++                with _ds.role_context(_ds.LATENCY):
++                    ds_runner._init_kv_zero_meta()
+ 
      @instrument(span_name="Warmup (GPU)")
      def compile_or_warm_up_model(self) -> CompilationTimes:
-+        times = self._compile_or_warm_up_one()
 +        ds_runner = getattr(self, "dual_stream_runner", None)
-+        if ds_runner is not None:
-+            from vllm.v1.worker import dual_stream as _ds
++        if ds_runner is None:
++            return self._compile_or_warm_up_one()
 +
-+            logger.info("dual-stream: warming up latency runner")
-+            saved = self.model_runner
-+            self.model_runner = ds_runner
-+            try:
-+                with _ds.on_stream(_ds.LATENCY):
-+                    self._compile_or_warm_up_one()
-+            finally:
-+                self.model_runner = saved
++        from vllm.v1.worker import dual_stream as _ds
++
++        with _ds.on_stream(_ds.THROUGHPUT):
++            times = self._compile_or_warm_up_one()
++
++        logger.info("dual-stream: warming up latency runner")
++        saved = self.model_runner
++        self.model_runner = ds_runner
++        try:
++            with _ds.on_stream(_ds.LATENCY):
++                self._compile_or_warm_up_one()
++        finally:
++            self.model_runner = saved
 +        return times
 +
 +    def _compile_or_warm_up_one(self) -> CompilationTimes:
          warmup_sizes: list[int] = []
-
+ 
          if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
-@@ -838,9 +895,13 @@ class Worker(WorkerBase):
-
+@@ -838,9 +903,13 @@ class Worker(WorkerBase):
+ 
      def reset_mm_cache(self) -> None:
          self.model_runner.reset_mm_cache()
 +        if (runner := getattr(self, "dual_stream_runner", None)) is not None:
 +            runner.reset_mm_cache()
-
+ 
      def reset_encoder_cache(self) -> None:
          self.model_runner.reset_encoder_cache()
 +        if (runner := getattr(self, "dual_stream_runner", None)) is not None:
 +            runner.reset_encoder_cache()
-
+ 
      def get_model(self) -> nn.Module:
          return self.model_runner.get_model()
-@@ -991,16 +1052,134 @@ class Worker(WorkerBase):
+@@ -991,16 +1060,134 @@ class Worker(WorkerBase):
              )
          return self.profiler.annotate_context_manager(annotation)
-
+ 
 +    @torch.inference_mode()
 +    @with_gpu_sync_check
 +    def execute_model_dual(
@@ -1309,7 +1494,7 @@ index ca63e0a..e8aef06 100644
 +            with _ds.on_stream(_ds.THROUGHPUT):
 +                return self.model_runner.sample_tokens(grammar_output)
          return self.model_runner.sample_tokens(grammar_output)
-
+ 
      @torch.inference_mode()
      @with_gpu_sync_check
      def execute_model(
@@ -1346,11 +1531,11 @@ index 6d06ba2..0f37223 100644
 +++ b/v1/worker/ubatching.py
 @@ -72,7 +72,7 @@ class UBatchContext:
          return False
-
+ 
      def _restore_context(self):
 -        forward_context._forward_context = self.forward_context
 +        forward_context.set_forward_context_for_current_thread(self.forward_context)
-
+ 
      def update_stream(self, stream):
          self.current_stream = stream
 @@ -95,7 +95,7 @@ class UBatchContext:
@@ -1361,26 +1546,26 @@ index 6d06ba2..0f37223 100644
 +        assert forward_context.get_forward_context() == self.forward_context
          assert current_stream() == self.current_stream
          assert not self.cpu_wait_event.is_set()
-
+ 
 diff --git a/v1/worker/worker_base.py b/v1/worker/worker_base.py
 index 9381d71..e210c17 100644
 --- a/v1/worker/worker_base.py
 +++ b/v1/worker/worker_base.py
 @@ -344,10 +344,14 @@ class WorkerWrapperBase:
              )
-
+ 
      def execute_model(
 -        self, scheduler_output: SchedulerOutput
 +        self, scheduler_output: SchedulerOutput, role: str | None = None
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
          self._apply_mm_cache(scheduler_output)
-
+ 
 +        # Dual-stream: forward the role only when set, so the single-engine RPC signature
 +        # and behaviour are byte-identical when the feature is off.
 +        if role is not None:
 +            return self.worker.execute_model(scheduler_output, role)
          return self.worker.execute_model(scheduler_output)
-
+ 
      def reset_mm_cache(self) -> None:
 diff --git a/v1/worker/workspace.py b/v1/worker/workspace.py
 index 1c502bf..c298356 100644
@@ -1389,7 +1574,7 @@ index 1c502bf..c298356 100644
 @@ -24,8 +24,22 @@ def _compute_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
  _MB = 1024**2
  _GiB = 1024**3
-
+ 
 -# Global workspace manager instance
 -_manager: "WorkspaceManager | None" = None
 +# The default workspace belongs to the normal throughput path. The latency
@@ -1408,8 +1593,8 @@ index 1c502bf..c298356 100644
 +    except ImportError:
 +        pass
 +    return None
-
-
+ 
+ 
  class WorkspaceManager:
 @@ -197,7 +211,7 @@ def is_workspace_manager_initialized() -> bool:
      Returns:
@@ -1417,8 +1602,8 @@ index 1c502bf..c298356 100644
      """
 -    return _manager is not None
 +    return _managers.get(_workspace_role()) is not None
-
-
+ 
+ 
  def current_workspace_manager() -> "WorkspaceManager":
 @@ -206,11 +220,18 @@ def current_workspace_manager() -> "WorkspaceManager":
      Raises:
@@ -1438,8 +1623,8 @@ index 1c502bf..c298356 100644
      )
 -    return _manager
 +    return manager
-
-
+ 
+ 
  def init_workspace_manager(
 @@ -225,15 +246,16 @@ def init_workspace_manager(
          device: The device to allocate workspace on.
@@ -1459,8 +1644,8 @@ index 1c502bf..c298356 100644
          )
 -    _manager = WorkspaceManager(device, num_ubatches)
 +    _managers[role] = WorkspaceManager(device, num_ubatches)
-
-
+ 
+ 
  def lock_workspace() -> None:
 @@ -275,5 +297,4 @@ def reset_workspace_manager() -> None:
      This is primarily intended for testing purposes to allow tests

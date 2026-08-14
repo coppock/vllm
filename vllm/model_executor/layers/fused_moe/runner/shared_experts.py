@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -51,7 +52,10 @@ class SharedExperts(torch.nn.Module):
         # DBO ubatch id to handle this case.  If DBO is not enabled, the
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
-        self._output: list[torch.Tensor | None] = [None, None]
+        # The model module can be shared by two dual-stream host threads.
+        # Keep transient outputs per host thread even when stream overlap is
+        # disabled, otherwise one forward can consume the other's tensor.
+        self._output_local = threading.local()
         self._layer = layer
         self._moe_config = moe_config
 
@@ -161,6 +165,14 @@ class SharedExperts(torch.nn.Module):
     @property
     def _output_idx(self) -> int:
         return dbo_current_ubatch_id() if self.enable_dbo else 0
+
+    @property
+    def _output(self) -> list[torch.Tensor | None]:
+        output = getattr(self._output_local, "value", None)
+        if output is None:
+            output = [None, None]
+            self._output_local.value = output
+        return output
 
     @property
     def output(self) -> torch.Tensor:

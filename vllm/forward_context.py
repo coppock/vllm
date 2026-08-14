@@ -197,6 +197,9 @@ class ForwardContext:
 _forward_context: ContextVar[ForwardContext | None] = ContextVar(
     "vllm_forward_context", default=None
 )
+_dual_stream_role: ContextVar[str | None] = ContextVar(
+    "vllm_dual_stream_role", default=None
+)
 
 
 def get_forward_context() -> ForwardContext:
@@ -211,6 +214,21 @@ def get_forward_context() -> ForwardContext:
 
 def is_forward_context_available() -> bool:
     return _forward_context.get() is not None
+
+
+def get_dual_stream_role() -> str | None:
+    """Return the execution role bound to this context, when dual-stream is active."""
+    return _dual_stream_role.get()
+
+
+@contextmanager
+def override_dual_stream_role(role: str | None):
+    """Bind a dual-stream role for model state that must be role-specific."""
+    token = _dual_stream_role.set(role)
+    try:
+        yield
+    finally:
+        _dual_stream_role.reset(token)
 
 
 def set_forward_context_for_current_thread(

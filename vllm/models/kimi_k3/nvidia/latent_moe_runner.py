@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import IntEnum
 
 import torch
@@ -73,6 +74,7 @@ class LatentMoERunner(MoERunner):
         self.enable_k3_latent_moe_tail_fusion = (
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(100)
+            and os.environ.get("VLLM_DUAL_STREAM", "0") != "1"
         )
         # Overlap the shared-expert all-reduce with the tier-1 up-projection.
         self._shared_ar_events = (torch.cuda.Event(), torch.cuda.Event())

@@ -3,6 +3,7 @@
 """Base class for attention-like layers."""
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 import torch
 
@@ -22,6 +23,38 @@ class AttentionLayerBase(ABC):
 
     impl: "AttentionImpl"
     supports_dcp: bool = True
+
+    @property
+    def kv_cache(self) -> Any:
+        """Return the cache bound to the current dual-stream role.
+
+        Dual runners share the model module and therefore its attention-layer
+        objects, but their cache allocations must remain disjoint. Outside
+        dual-stream execution this behaves like the original plain attribute.
+        """
+        from vllm.forward_context import get_dual_stream_role
+
+        role = get_dual_stream_role()
+        role_caches = getattr(self, "_dual_stream_kv_caches", None)
+        if role is not None and role_caches is not None and role in role_caches:
+            return role_caches[role]
+        if hasattr(self, "_kv_cache"):
+            return self._kv_cache
+        raise AttributeError("KV cache has not been bound")
+
+    @kv_cache.setter
+    def kv_cache(self, value: Any) -> None:
+        from vllm.forward_context import get_dual_stream_role
+
+        role = get_dual_stream_role()
+        if role is None:
+            self._kv_cache = value
+            return
+        role_caches = getattr(self, "_dual_stream_kv_caches", None)
+        if role_caches is None:
+            role_caches = {}
+            self._dual_stream_kv_caches = role_caches
+        role_caches[role] = value
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         """Bind the allocated KV cache tensor to this layer.

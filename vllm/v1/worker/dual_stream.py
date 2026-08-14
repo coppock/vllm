@@ -352,18 +352,16 @@ def on_stream(role: str):
     if not enabled() or role not in _streams:
         yield None
         return
-    prev = getattr(_thread_state, "role", None)
     prev_index = getattr(_thread_state, "collective_index", None)
-    _thread_state.role = role
     _thread_state.collective_index = 0
     try:
         with (
+            role_context(role),
             ps.override_tp_group(_tp_groups[role]),
             torch.cuda.stream(_streams[role]),
         ):
             yield _streams[role]
     finally:
-        _thread_state.role = prev
         _thread_state.collective_index = prev_index
 
 
@@ -374,3 +372,17 @@ def stream(role: str):
 def current_role() -> str | None:
     """Return the dual-stream role bound to the current host thread."""
     return getattr(_thread_state, "role", None)
+
+
+@contextlib.contextmanager
+def role_context(role: str):
+    """Bind role-specific model state without changing the active CUDA stream."""
+    from vllm.forward_context import override_dual_stream_role
+
+    prev = getattr(_thread_state, "role", None)
+    _thread_state.role = role
+    try:
+        with override_dual_stream_role(role):
+            yield
+    finally:
+        _thread_state.role = prev

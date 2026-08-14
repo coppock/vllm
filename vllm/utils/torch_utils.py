@@ -831,6 +831,12 @@ def aux_stream() -> torch.cuda.Stream | None:
     """
     global _aux_stream
 
+    # A model's process-global auxiliary stream and events are not safe when
+    # two host threads execute the shared module concurrently. Dual-stream
+    # already supplies one CUDA stream per role, so keep model internals on it.
+    if os.environ.get("VLLM_DUAL_STREAM", "0") == "1":
+        return None
+
     from vllm.platforms import current_platform
 
     if _aux_stream is None and current_platform.is_cuda_alike():

@@ -6,7 +6,15 @@ import threading
 import torch
 
 import vllm.distributed.parallel_state as parallel_state
-from vllm.forward_context import get_forward_context, override_forward_context
+import vllm.utils.torch_utils as torch_utils
+from vllm.forward_context import (
+    get_dual_stream_role,
+    get_forward_context,
+    override_dual_stream_role,
+    override_forward_context,
+)
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
 from vllm.v1.worker import dual_stream, workspace
 
 
@@ -18,6 +26,14 @@ class _FakeEvent:
 class _FakeStream:
     def wait_event(self, event):
         self.waited_for = event
+
+
+class _FakeAttentionLayer(AttentionLayerBase):
+    def get_attn_backend(self):
+        return None
+
+    def get_kv_cache_spec(self, vllm_config):
+        return None
 
 
 def _patch_fake_cuda(monkeypatch):
@@ -105,6 +121,62 @@ def test_forward_context_is_isolated_between_threads():
 
     assert all(not thread.is_alive() for thread in threads)
     assert observed == contexts
+
+
+def test_kv_cache_binding_is_isolated_by_role():
+    layer = _FakeAttentionLayer()
+    fallback = object()
+    latency = object()
+    throughput = object()
+    layer.bind_kv_cache(fallback)
+
+    with override_dual_stream_role(dual_stream.LATENCY):
+        layer.bind_kv_cache(latency)
+    with override_dual_stream_role(dual_stream.THROUGHPUT):
+        layer.bind_kv_cache(throughput)
+
+    assert layer.kv_cache is fallback
+    with override_dual_stream_role(dual_stream.LATENCY):
+        assert layer.kv_cache is latency
+    with override_dual_stream_role(dual_stream.THROUGHPUT):
+        assert layer.kv_cache is throughput
+
+
+def test_role_context_binds_model_state_role():
+    assert get_dual_stream_role() is None
+    with dual_stream.role_context(dual_stream.LATENCY):
+        assert get_dual_stream_role() == dual_stream.LATENCY
+        assert dual_stream.current_role() == dual_stream.LATENCY
+    assert get_dual_stream_role() is None
+
+
+def test_aux_stream_is_disabled_in_dual_mode(monkeypatch):
+    sentinel = object()
+    monkeypatch.setenv("VLLM_DUAL_STREAM", "1")
+    monkeypatch.setattr(torch_utils, "_aux_stream", sentinel)
+
+    assert torch_utils.aux_stream() is None
+
+
+def test_shared_expert_transient_output_is_thread_local():
+    shared_experts = object.__new__(SharedExperts)
+    shared_experts._output_local = threading.local()
+    observed = [None, None]
+    barrier = threading.Barrier(2)
+
+    def run(index):
+        shared_experts._output[0] = index
+        barrier.wait()
+        observed[index] = shared_experts._output[0]
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert observed == [0, 1]
 
 
 def test_latency_role_gets_a_distinct_workspace(monkeypatch):

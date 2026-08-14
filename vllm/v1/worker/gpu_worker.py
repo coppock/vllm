@@ -695,8 +695,10 @@ class Worker(WorkerBase):
                 kv_cache_config, _ds.latency_kv_fraction()
             )
             with self._maybe_get_memory_pool_context(tag="kv_cache"):
-                self.model_runner.initialize_kv_cache(thr_cfg)
-                latency_runner.initialize_kv_cache(lat_cfg)
+                with _ds.role_context(_ds.THROUGHPUT):
+                    self.model_runner.initialize_kv_cache(thr_cfg)
+                with _ds.role_context(_ds.LATENCY):
+                    latency_runner.initialize_kv_cache(lat_cfg)
         else:
             with self._maybe_get_memory_pool_context(tag="kv_cache"):
                 self.model_runner.initialize_kv_cache(kv_cache_config)
@@ -710,28 +712,34 @@ class Worker(WorkerBase):
         if kv_cache_config.needs_kv_cache_zeroing and hasattr(
             self.model_runner, "_init_kv_zero_meta"
         ):
-            self.model_runner._init_kv_zero_meta()
+            with _ds.role_context(_ds.THROUGHPUT):
+                self.model_runner._init_kv_zero_meta()
             # The latency runner has its own KV tensors, so it needs its own zeroing
             # metadata; without it update_requests asserts on a null kv_block_zeroer.
             ds_runner = getattr(self, "dual_stream_runner", None)
             if ds_runner is not None and hasattr(ds_runner, "_init_kv_zero_meta"):
-                ds_runner._init_kv_zero_meta()
+                with _ds.role_context(_ds.LATENCY):
+                    ds_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        times = self._compile_or_warm_up_one()
         ds_runner = getattr(self, "dual_stream_runner", None)
-        if ds_runner is not None:
-            from vllm.v1.worker import dual_stream as _ds
+        if ds_runner is None:
+            return self._compile_or_warm_up_one()
 
-            logger.info("dual-stream: warming up latency runner")
-            saved = self.model_runner
-            self.model_runner = ds_runner
-            try:
-                with _ds.on_stream(_ds.LATENCY):
-                    self._compile_or_warm_up_one()
-            finally:
-                self.model_runner = saved
+        from vllm.v1.worker import dual_stream as _ds
+
+        with _ds.on_stream(_ds.THROUGHPUT):
+            times = self._compile_or_warm_up_one()
+
+        logger.info("dual-stream: warming up latency runner")
+        saved = self.model_runner
+        self.model_runner = ds_runner
+        try:
+            with _ds.on_stream(_ds.LATENCY):
+                self._compile_or_warm_up_one()
+        finally:
+            self.model_runner = saved
         return times
 
     def _compile_or_warm_up_one(self) -> CompilationTimes:

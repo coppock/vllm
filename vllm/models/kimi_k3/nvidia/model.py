@@ -3,6 +3,7 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
+import os
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -1050,7 +1051,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # Aux stream for overlapping the MLA g_proj output-gate GEMM with the
         # attention front-end (DeepseekV4 convention: created at the model
         # level and threaded into each attention layer).
-        aux_stream = torch.cuda.Stream()
+        # These events and this stream are shared by every layer in the model.
+        # Dual runners share the model too, so concurrent use would race.
+        aux_stream = (
+            None
+            if os.environ.get("VLLM_DUAL_STREAM", "0") == "1"
+            else torch.cuda.Stream()
+        )
 
         def get_layer(prefix: str):
             return KimiDecoderLayer(
